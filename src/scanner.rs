@@ -482,7 +482,107 @@ pub fn load_declared_roots(repo_root: &std::path::Path) -> Vec<(String, std::pat
         .collect()
 }
 
+// ── Skipped-file census (#895) ───────────────────────────────────────
+//
+// Every candidate file the walk sees is classified into exactly one of six
+// buckets. `excluded_by_config`/`git_ignored` are decided purely by the walk
+// (`Scanner::scan`) and recomputed fresh on every scan, full or incremental,
+// because the walk always re-visits every non-pruned directory (mtime-based
+// skipping only shortcuts *extraction*, not the directory listing itself —
+// see `carry_forward_subtree`). `indexed`/`binary_skipped`/`no_extractor`/
+// `extractor_error` are decided during extraction, which only reprocesses
+// changed+new files; their per-file classification is therefore persisted
+// in `ScanState.file_classifications` and carried forward untouched for
+// unchanged files so an incremental scan still reports the full population.
+
+/// How many example file paths to retain per exclusion class for the
+/// on-demand detail view. Kept small so `scan-state.json` stays cheap to
+/// read/write even when a repo excludes a huge subtree (e.g. `node_modules`).
+pub const CENSUS_SAMPLE_CAP: usize = 20;
+
+/// Bounded per-class census: an exact count plus a capped sample of paths,
+/// used for `excluded_by_config` and `git_ignored` (classes decided by the
+/// walk itself, not by extraction).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ClassCensus {
+    /// Exact count of files in this class (never truncated).
+    pub count: usize,
+    /// First `CENSUS_SAMPLE_CAP` file paths encountered, for the detail view.
+    pub samples: Vec<PathBuf>,
+}
+
+impl ClassCensus {
+    fn record(&mut self, path: PathBuf) {
+        self.count += 1;
+        if self.samples.len() < CENSUS_SAMPLE_CAP {
+            self.samples.push(path);
+        }
+    }
+}
+
+/// The reason a directory was pruned from the walk. A pruned directory is
+/// recorded once, by reason; its contents are not enumerated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PruneReason {
+    Config,
+    GitIgnore,
+}
+
+/// Mutable census accumulator threaded through the walk. Borrows the two
+/// `ScanState` fields for the duration of `scan()` so both the top-level
+/// `walk_dir_mtime` call and the `carry_forward_subtree` recursion record
+/// into the same totals.
+struct CensusAccumulator<'a> {
+    excluded_by_config: &'a mut ClassCensus,
+    git_ignored: &'a mut ClassCensus,
+    pruned_dirs_by_config: &'a mut ClassCensus,
+    pruned_dirs_git_ignored: &'a mut ClassCensus,
+}
+
+impl CensusAccumulator<'_> {
+    fn record(&mut self, reason: PruneReason, path: PathBuf) {
+        match reason {
+            PruneReason::Config => self.excluded_by_config.record(path),
+            PruneReason::GitIgnore => self.git_ignored.record(path),
+        }
+    }
+
+    fn record_pruned_dir(&mut self, reason: PruneReason, dir: PathBuf) {
+        match reason {
+            PruneReason::Config => self.pruned_dirs_by_config.record(dir),
+            PruneReason::GitIgnore => self.pruned_dirs_git_ignored.record(dir),
+        }
+    }
+}
+
+/// Extraction-side classification of a single file, one of the four classes
+/// decided by [`crate::extract::ExtractorRegistry`] rather than by the walk.
+/// `lossy_decoded` is deliberately not a class here: those files ARE indexed
+/// (see `EncodingStats`), just via a lossy UTF-8 fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileClass {
+    Indexed,
+    BinarySkipped,
+    NoExtractor,
+    ExtractorError,
+}
+
+/// A file's extraction-side classification plus an optional human-readable
+/// detail (declined-extractor name, error message, "extension unclaimed",
+/// etc.) surfaced in the on-demand detail view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileClassification {
+    pub class: FileClass,
+    pub detail: Option<String>,
+}
+
 // ── Public types ────────────────────────────────────────────────────
+
+/// Version of the scan-state census contract. State written before the
+/// skipped-file census existed loads as version 0 and is migrated once by
+/// forcing a full re-extraction (#895).
+pub const CENSUS_STATE_VERSION: u32 = 1;
 
 /// Persistent scan state, serialized to `.oh/.cache/scan-state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -493,6 +593,35 @@ pub struct ScanState {
     /// Per-file mtime at last scan (relative paths from repo root).
     #[serde(default)]
     pub file_mtimes: HashMap<PathBuf, SystemTimeWrapper>,
+    /// Extraction-side classification (indexed/binary/no_extractor/error) for
+    /// every file currently tracked in `file_mtimes` (#895). Updated for
+    /// changed+new files whenever extraction runs; carried forward untouched
+    /// for unchanged files so incremental scans still report the full
+    /// population. Entries are removed when their file is deleted.
+    #[serde(default)]
+    pub file_classifications: HashMap<PathBuf, FileClassification>,
+    /// Files excluded by a default or `.oh/config.toml` pattern, recomputed
+    /// fresh on every scan (#895).
+    #[serde(default)]
+    pub excluded_by_config_census: ClassCensus,
+    /// Files pruned by `.gitignore`, recomputed fresh on every scan (#895).
+    /// Always zero (with no samples) for a root that has no `.git`.
+    #[serde(default)]
+    pub git_ignored_census: ClassCensus,
+    /// Directories pruned wholesale by a default or config exclude (`target/`,
+    /// `node_modules/`, ...), recorded once each. Their contents are never
+    /// enumerated: doing so walked ~46k build-artifact files on this repo and
+    /// cost ~1.2s per scan while inflating the population with files that
+    /// were never candidates (#895).
+    #[serde(default)]
+    pub pruned_dirs_by_config: ClassCensus,
+    /// Directories pruned wholesale by `.gitignore`, recorded once each (#895).
+    #[serde(default)]
+    pub pruned_dirs_git_ignored: ClassCensus,
+    /// Census contract version this state was last written under. `0` means
+    /// the state predates the census (see `CENSUS_STATE_VERSION`).
+    #[serde(default)]
+    pub census_version: u32,
     /// BLAKE3 content hashes per file (hex-encoded). Used to detect mtime
     /// false positives: if mtime changed but content hash is identical,
     /// the file is not truly changed and extraction can be skipped.
@@ -666,6 +795,61 @@ impl Scanner {
         self.state.cochange_watermark_sha = sha;
     }
 
+    /// Skipped-file census for `excluded_by_config` (#895): count plus a
+    /// bounded sample, fresh as of the most recent `scan()` call.
+    pub fn excluded_by_config_census(&self) -> &ClassCensus {
+        &self.state.excluded_by_config_census
+    }
+
+    /// Skipped-file census for `git_ignored` (#895): count plus a bounded
+    /// sample, fresh as of the most recent `scan()` call. Always empty for a
+    /// root with no `.git`.
+    pub fn git_ignored_census(&self) -> &ClassCensus {
+        &self.state.git_ignored_census
+    }
+
+    /// Directories pruned wholesale by a config exclude (#895): recorded once
+    /// each, contents never enumerated.
+    pub fn pruned_dirs_by_config(&self) -> &ClassCensus {
+        &self.state.pruned_dirs_by_config
+    }
+
+    /// Directories pruned wholesale by `.gitignore` (#895).
+    pub fn pruned_dirs_git_ignored(&self) -> &ClassCensus {
+        &self.state.pruned_dirs_git_ignored
+    }
+
+    /// Per-file extraction classification for every file currently tracked
+    /// (#895): `indexed` / `binary_skipped` / `no_extractor` / `extractor_error`.
+    pub fn file_classifications(&self) -> &HashMap<PathBuf, FileClassification> {
+        &self.state.file_classifications
+    }
+
+    /// Merge freshly-computed classifications for changed+new files into the
+    /// persisted map, leaving unchanged files' classifications untouched.
+    /// Callers must call `commit_state()` afterwards to persist the merge.
+    pub fn apply_file_classifications(&mut self, updates: HashMap<PathBuf, FileClassification>) {
+        self.state.file_classifications.extend(updates);
+    }
+
+    /// Replace the entire classification map (used when a full re-extract of
+    /// every known file just ran, e.g. a cache-miss rebuild): every file's
+    /// classification is fresh, so nothing should be carried forward.
+    pub fn set_file_classifications(
+        &mut self,
+        classifications: HashMap<PathBuf, FileClassification>,
+    ) {
+        self.state.file_classifications = classifications;
+    }
+
+    /// Drop classifications for files that no longer exist. Callers must
+    /// call `commit_state()` afterwards to persist the removal.
+    pub fn remove_file_classifications(&mut self, deleted: &[PathBuf]) {
+        for path in deleted {
+            self.state.file_classifications.remove(path);
+        }
+    }
+
     /// Persist the scanner's in-memory state to disk.
     ///
     /// Call this **after** the caller has successfully processed the scan results
@@ -796,14 +980,35 @@ impl Scanner {
         let mut new_dir_mtimes: HashMap<PathBuf, SystemTimeWrapper> = HashMap::new();
         let mut new_file_mtimes: HashMap<PathBuf, SystemTimeWrapper> = HashMap::new();
 
-        self.walk_dir_mtime(
-            &self.repo_root.clone(),
-            git_ignore.as_ref(),
-            &mut changed_files,
-            &mut new_files,
-            &mut new_dir_mtimes,
-            &mut new_file_mtimes,
-        )?;
+        // Skipped-file census (#895): rebuilt from scratch on every scan,
+        // full or incremental, since the walk always re-visits every
+        // non-pruned directory (only extraction is short-circuited for
+        // unchanged files, not the directory listing itself).
+        let mut excluded_by_config_census = ClassCensus::default();
+        let mut git_ignored_census = ClassCensus::default();
+        let mut pruned_dirs_by_config = ClassCensus::default();
+        let mut pruned_dirs_git_ignored = ClassCensus::default();
+        {
+            let mut census = CensusAccumulator {
+                excluded_by_config: &mut excluded_by_config_census,
+                git_ignored: &mut git_ignored_census,
+                pruned_dirs_by_config: &mut pruned_dirs_by_config,
+                pruned_dirs_git_ignored: &mut pruned_dirs_git_ignored,
+            };
+            self.walk_dir_mtime(
+                &self.repo_root.clone(),
+                git_ignore.as_ref(),
+                &mut changed_files,
+                &mut new_files,
+                &mut new_dir_mtimes,
+                &mut new_file_mtimes,
+                &mut census,
+            )?;
+        }
+        self.state.excluded_by_config_census = excluded_by_config_census;
+        self.state.git_ignored_census = git_ignored_census;
+        self.state.pruned_dirs_by_config = pruned_dirs_by_config;
+        self.state.pruned_dirs_git_ignored = pruned_dirs_git_ignored;
 
         // Merge git-detected changes (may include files the mtime walk
         // already found — deduplicate via the file_mtimes map check).
@@ -919,6 +1124,33 @@ impl Scanner {
             }
         }
 
+        // Census migration (#895): scan state written before the census has
+        // tracked files but no `file_classifications`. A no-change scan would
+        // preserve that empty map forever and `list_roots` would claim zero
+        // indexed files. Force one full re-extraction so every tracked file is
+        // classified; from then on the map is maintained incrementally. This
+        // runs AFTER the BLAKE3 false-positive filter above on purpose: these
+        // files are content-unchanged, and the filter would drop them again.
+        if self.state.census_version < CENSUS_STATE_VERSION && !self.state.file_mtimes.is_empty() {
+            let already: std::collections::HashSet<&PathBuf> =
+                changed_files.iter().chain(new_files.iter()).collect();
+            let forced: Vec<PathBuf> = self
+                .state
+                .file_mtimes
+                .keys()
+                .filter(|p| !already.contains(p) && self.repo_root.join(p).is_file())
+                .cloned()
+                .collect();
+            if !forced.is_empty() {
+                tracing::info!(
+                    "Scanner: census migration -- re-extracting {} tracked file(s) whose scan state predates the skipped-file census",
+                    forced.len()
+                );
+                changed_files.extend(forced);
+            }
+        }
+        self.state.census_version = CENSUS_STATE_VERSION;
+
         self.state.dir_mtimes = new_dir_mtimes;
         self.state.file_mtimes = new_file_mtimes;
         self.state.file_content_hashes = new_content_hashes;
@@ -959,6 +1191,7 @@ impl Scanner {
     /// - If its mtime matches stored state, skip the entire subtree.
     /// - If mtime changed (or not in state), enumerate files and compare
     ///   individual file mtimes.
+    #[allow(clippy::too_many_arguments)]
     fn walk_dir_mtime(
         &self,
         dir: &Path,
@@ -967,6 +1200,7 @@ impl Scanner {
         new: &mut Vec<PathBuf>,
         new_dir_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
         new_file_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
+        census: &mut CensusAccumulator<'_>,
     ) -> Result<()> {
         let dir_start = Instant::now();
         let rel_dir = dir
@@ -979,9 +1213,12 @@ impl Scanner {
             rel_dir.display().to_string()
         };
 
-        // Check exclude patterns for this directory
+        // Check exclude patterns for this directory. Split so the census can
+        // tell config-exclude and git-ignore apart (#895); config wins when
+        // both match, same precedence the original collapsed check had.
         if !rel_dir.as_os_str().is_empty() && self.is_excluded_dir(&rel_dir) {
             tracing::debug!("Scanner: skipping excluded directory {}", rel_dir_display);
+            self.record_pruned_dir(dir, PruneReason::Config, census);
             return Ok(());
         }
         if dir != self.repo_root && Self::is_git_ignored(git_ignore, dir) {
@@ -989,6 +1226,7 @@ impl Scanner {
                 "Scanner: skipping git-ignored directory {}",
                 rel_dir_display
             );
+            self.record_pruned_dir(dir, PruneReason::GitIgnore, census);
             return Ok(());
         }
 
@@ -1025,6 +1263,7 @@ impl Scanner {
                 new,
                 new_dir_mtimes,
                 new_file_mtimes,
+                census,
             )?;
             tracing::debug!(
                 "Scanner: carried subtree {} in {:?}",
@@ -1056,6 +1295,7 @@ impl Scanner {
                     new,
                     new_dir_mtimes,
                     new_file_mtimes,
+                    census,
                 )?;
             } else if ft.is_file() {
                 let file_start = Instant::now();
@@ -1064,11 +1304,19 @@ impl Scanner {
                     .unwrap_or(&path)
                     .to_path_buf();
 
-                if self.is_excluded(&rel_file) || Self::is_git_ignored(git_ignore, &path) {
+                // Split so the census can tell config-exclude and git-ignore
+                // apart (#895); config wins when both match.
+                if self.is_excluded(&rel_file) {
                     tracing::debug!(
-                        "Scanner: skipping excluded or git-ignored file {}",
+                        "Scanner: skipping config-excluded file {}",
                         rel_file.display()
                     );
+                    census.record(PruneReason::Config, rel_file);
+                    continue;
+                }
+                if Self::is_git_ignored(git_ignore, &path) {
+                    tracing::debug!("Scanner: skipping git-ignored file {}", rel_file.display());
+                    census.record(PruneReason::GitIgnore, rel_file);
                     continue;
                 }
 
@@ -1113,6 +1361,7 @@ impl Scanner {
     /// The optimization here: we skip subdirectories whose directory mtime
     /// is also unchanged, avoiding deep tree traversal when entire subtrees
     /// are untouched.
+    #[allow(clippy::too_many_arguments)]
     fn carry_forward_subtree(
         &self,
         dir: &Path,
@@ -1121,6 +1370,7 @@ impl Scanner {
         new: &mut Vec<PathBuf>,
         new_dir_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
         new_file_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
+        census: &mut CensusAccumulator<'_>,
     ) -> Result<()> {
         let subtree_start = Instant::now();
         let rel_dir = dir
@@ -1152,11 +1402,20 @@ impl Scanner {
                     .unwrap_or(&path)
                     .to_path_buf();
 
-                if self.is_excluded_dir(&rel_dir) || Self::is_git_ignored(git_ignore, &path) {
+                if self.is_excluded_dir(&rel_dir) {
                     tracing::debug!(
-                        "Scanner: skipping excluded or git-ignored directory {} during subtree carry",
+                        "Scanner: skipping config-excluded directory {} during subtree carry",
                         rel_dir.display()
                     );
+                    self.record_pruned_dir(&path, PruneReason::Config, census);
+                    continue;
+                }
+                if Self::is_git_ignored(git_ignore, &path) {
+                    tracing::debug!(
+                        "Scanner: skipping git-ignored directory {} during subtree carry",
+                        rel_dir.display()
+                    );
+                    self.record_pruned_dir(&path, PruneReason::GitIgnore, census);
                     continue;
                 }
 
@@ -1184,6 +1443,7 @@ impl Scanner {
                         new,
                         new_dir_mtimes,
                         new_file_mtimes,
+                        census,
                     )?;
                 } else {
                     // Subdirectory also unchanged: recurse with same logic
@@ -1194,6 +1454,7 @@ impl Scanner {
                         new,
                         new_dir_mtimes,
                         new_file_mtimes,
+                        census,
                     )?;
                 }
             } else if ft.is_file() {
@@ -1203,11 +1464,20 @@ impl Scanner {
                     .unwrap_or(&path)
                     .to_path_buf();
 
-                if self.is_excluded(&rel_file) || Self::is_git_ignored(git_ignore, &path) {
+                if self.is_excluded(&rel_file) {
                     tracing::debug!(
-                        "Scanner: skipping excluded or git-ignored file {} during subtree carry",
+                        "Scanner: skipping config-excluded file {} during subtree carry",
                         rel_file.display()
                     );
+                    census.record(PruneReason::Config, rel_file);
+                    continue;
+                }
+                if Self::is_git_ignored(git_ignore, &path) {
+                    tracing::debug!(
+                        "Scanner: skipping git-ignored file {} during subtree carry",
+                        rel_file.display()
+                    );
+                    census.record(PruneReason::GitIgnore, rel_file);
                     continue;
                 }
 
@@ -1244,6 +1514,31 @@ impl Scanner {
         );
 
         Ok(())
+    }
+
+    /// Attribute every file beneath a pruned directory to `reason` (#895),
+    /// without paying the cost of the real walk: no stat, no content hash, no
+    /// extraction — just a recursive directory listing. This keeps counting
+    /// cheap even for a huge excluded subtree (e.g. `target/`, `node_modules/`)
+    /// that the real walk deliberately never descends into.
+    ///
+    /// Best-effort: an unreadable directory just stops contributing to the
+    /// count rather than failing the whole scan.
+    /// Record a directory the walk pruned (config exclude or `.gitignore`)
+    /// once, without enumerating its contents. Descending into pruned trees
+    /// to count files walked ~46k `target/` artifacts on this repository,
+    /// cost ~1.2s per scan, and counted files that were never candidates.
+    fn record_pruned_dir(
+        &self,
+        dir: &Path,
+        reason: PruneReason,
+        census: &mut CensusAccumulator<'_>,
+    ) {
+        let rel_dir = dir
+            .strip_prefix(&self.repo_root)
+            .unwrap_or(dir)
+            .to_path_buf();
+        census.record_pruned_dir(reason, rel_dir);
     }
 
     // ── Git optimization ────────────────────────────────────────────
@@ -1647,6 +1942,22 @@ fn save_state_to_path(path: &Path, state: &ScanState) -> Result<()> {
     Ok(())
 }
 
+/// Read persisted scan state from an arbitrary path, without constructing a
+/// `Scanner` (#895). Used by `list_roots` to render the skipped-file census
+/// straight from disk so it works even outside a live scan/server session.
+/// Returns `None` if the state file is missing, corrupt, or unreadable —
+/// callers should render "not yet scanned" rather than propagate an error.
+pub fn load_scan_state_from_path(path: &Path) -> Option<ScanState> {
+    load_state_from_path(path).ok()
+}
+
+/// The primary root's scan-state path: `.oh/.cache/scan-state.json` under
+/// `repo_root`. Exposed so callers outside this module (e.g. `list_roots`)
+/// can locate it without duplicating the layout (#895).
+pub fn primary_state_path(repo_root: &Path) -> PathBuf {
+    state_path(repo_root)
+}
+
 /// Read the co-change watermark directly from persisted scan state (#884),
 /// without constructing a full `Scanner`. Used by incremental graph updates
 /// that receive a pre-computed `ScanResult` and may not hold a live `Scanner`
@@ -1806,6 +2117,68 @@ mod tests {
             load_state(&repo_root).unwrap().last_commit_sha,
             Some("bbbbbbb".to_string()),
             "commit_state must still persist its own fields"
+        );
+    }
+
+    /// #895: an excluded directory is recorded once as pruned; its contents are
+    /// never enumerated or counted as excluded files.
+    /// #895: scan state from before the census (tracked files, empty
+    /// classifications) must trigger one full re-extraction instead of a
+    /// no-change scan that would leave the census empty forever.
+    #[test]
+    fn pre_census_scan_state_forces_full_reextraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for rel in ["src/a.rs", "src/b.rs", "README.md"] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x\n").unwrap();
+        }
+        // First scan tracks the files; simulate pre-census state by dropping
+        // classifications before committing.
+        let mut first = Scanner::new(root.to_path_buf()).unwrap();
+        first.scan().unwrap();
+        first.state.file_classifications.clear();
+        first.state.census_version = 0; // as written by a pre-census binary
+        first.commit_state().unwrap();
+
+        // Nothing changed on disk, yet the migration must re-extract everything.
+        let mut second = Scanner::new(root.to_path_buf()).unwrap();
+        let result = second.scan().unwrap();
+        let mut forced: Vec<String> = result
+            .changed_files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        forced.sort();
+        assert_eq!(forced, vec!["README.md", "src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn excluded_directory_is_recorded_once_not_enumerated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for rel in [
+            "src/main.rs",
+            "target/a.rs",
+            "target/deep/b.rs",
+            "target/deep/er/c.rs",
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "fn x() {}\n").unwrap();
+        }
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        scanner.scan().unwrap();
+        assert_eq!(scanner.pruned_dirs_by_config().count, 1);
+        assert_eq!(
+            scanner.pruned_dirs_by_config().samples,
+            vec![PathBuf::from("target")]
+        );
+        assert_eq!(
+            scanner.excluded_by_config_census().count,
+            0,
+            "files under a pruned directory must not be counted individually"
         );
     }
 

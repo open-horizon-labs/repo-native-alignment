@@ -1,5 +1,6 @@
 //! Graph lifecycle: building, incremental updates, and state management.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,6 +14,15 @@ pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
 pub(super) struct IncrementalUpdateOutcome {
     pub(super) persist_succeeded: bool,
     pub(super) lsp_job_id: Option<String>,
+    /// Skipped-file census (#895): classifications for the changed+new files
+    /// this update processed. When `pending_scan` was `Some`, the caller
+    /// owns the `Scanner` and must merge these (and `deleted_files`) into it
+    /// before calling `commit_state()` -- this method already did so for its
+    /// own `fallback_scanner` when `pending_scan` was `None`.
+    pub(super) file_classifications: HashMap<PathBuf, crate::scanner::FileClassification>,
+    /// Files this update found deleted, for dropping their classification
+    /// entries (paired with `file_classifications` above).
+    pub(super) deleted_files: Vec<PathBuf>,
 }
 
 use crate::embed::EmbeddingIndex;
@@ -1059,11 +1069,15 @@ impl RnaHandler {
 
                     // Extract new + changed files
                     let registry = ExtractorRegistry::with_builtins();
-                    let (mut extraction, enc_stats) =
-                        registry.extract_scan_result_with_stats(&repo_root, &scan);
+                    let (mut extraction, enc_stats, classifications) =
+                        registry.extract_scan_result_with_census(&repo_root, &scan);
                     if let Ok(mut stats) = scan_stats.write() {
                         stats.merge_encoding_stats(&primary_slug, &enc_stats);
                     }
+                    // Skipped-file census (#895): merge into the scanner state
+                    // this background pipeline will `commit_state()` below.
+                    scanner.apply_file_classifications(classifications);
+                    scanner.remove_file_classifications(&scan.deleted_files);
                     for node in &mut extraction.nodes {
                         node.id.root = primary_slug.clone();
                     }
@@ -1946,8 +1960,8 @@ impl RnaHandler {
         let mut freshly_extracted_slugs: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        for (root_slug, scanner, _scan_result, root_path, root_changed) in &scanners {
-            if !root_changed {
+        for (root_slug, scanner, _scan_result, root_path, root_changed) in &mut scanners {
+            if !*root_changed {
                 // Clean root: load from pre-indexed cache if available, otherwise extract.
                 if has_cached_graph {
                     let cached_nodes = cached_nodes_by_root.remove(root_slug);
@@ -1994,13 +2008,16 @@ impl RnaHandler {
                 deleted_files: Vec::new(),
                 scan_duration: std::time::Duration::ZERO,
             };
-            let (mut extraction, enc_stats) =
-                registry.extract_scan_result_with_stats(root_path, &full_scan);
+            let (mut extraction, enc_stats, classifications) =
+                registry.extract_scan_result_with_census(root_path, &full_scan);
 
             // Record encoding stats for this root (full scan: replace totals).
             if let Ok(mut stats) = self.scan_stats.write() {
                 stats.set_encoding_stats(root_slug, enc_stats);
             }
+            // Skipped-file census (#895): every known file was just
+            // re-extracted, so replace rather than merge.
+            scanner.set_file_classifications(classifications);
 
             for node in &mut extraction.nodes {
                 node.id.root = root_slug.clone();
@@ -2746,6 +2763,30 @@ impl RnaHandler {
             .persist_succeeded)
     }
 
+    /// Same as [`update_graph_with_scan`](Self::update_graph_with_scan), but
+    /// also returns the skipped-file census (#895) for changed+new files so
+    /// a caller that owns its own `Scanner` (i.e. passed `Some(pending_scan)`)
+    /// can merge it in before calling `commit_state()`.
+    pub async fn update_graph_with_scan_census(
+        &self,
+        graph: &mut GraphState,
+        pending_scan: Option<ScanResult>,
+        enrichment: ScanEnrichmentOptions,
+    ) -> anyhow::Result<(
+        bool,
+        HashMap<PathBuf, crate::scanner::FileClassification>,
+        Vec<PathBuf>,
+    )> {
+        let outcome = self
+            .update_graph_with_scan_outcome(graph, pending_scan, enrichment)
+            .await?;
+        Ok((
+            outcome.persist_succeeded,
+            outcome.file_classifications,
+            outcome.deleted_files,
+        ))
+    }
+
     pub(super) async fn update_graph_with_scan_outcome(
         &self,
         graph: &mut GraphState,
@@ -2783,6 +2824,8 @@ impl RnaHandler {
             return Ok(IncrementalUpdateOutcome {
                 persist_succeeded: true,
                 lsp_job_id: None,
+                file_classifications: HashMap::new(),
+                deleted_files: Vec::new(),
             });
         }
 
@@ -2900,8 +2943,8 @@ impl RnaHandler {
         graph.edges.retain(|e| !purge_edge(e));
 
         // Extract new + changed files
-        let (mut extraction, enc_stats) =
-            registry.extract_scan_result_with_stats(&self.repo_root, &scan);
+        let (mut extraction, enc_stats, file_classifications) =
+            registry.extract_scan_result_with_census(&self.repo_root, &scan);
 
         // Set root slug on extracted nodes and edges.
         // Extractors don't set root -- the caller must assign it, matching the
@@ -3678,7 +3721,14 @@ impl RnaHandler {
         // Commit fallback scanner state only after successful persist.
         // If persist failed, scanner state is left uncommitted so the next scan
         // re-detects the same changes and retries the LanceDB write.
-        if persist_succeeded && let Some(scanner) = fallback_scanner {
+        if persist_succeeded && let Some(mut scanner) = fallback_scanner {
+            // Skipped-file census (#895): this method owns `fallback_scanner`
+            // end to end, so merge classifications here. When the caller
+            // supplied `pending_scan` instead, it owns the `Scanner` and must
+            // merge `file_classifications`/`deleted_files` from the returned
+            // outcome itself before its own `commit_state()`.
+            scanner.apply_file_classifications(file_classifications.clone());
+            scanner.remove_file_classifications(&scan.deleted_files);
             scanner.commit_state()?;
         }
 
@@ -3687,6 +3737,8 @@ impl RnaHandler {
         Ok(IncrementalUpdateOutcome {
             persist_succeeded,
             lsp_job_id: incremental_lsp_job_id,
+            file_classifications,
+            deleted_files: scan.deleted_files.clone(),
         })
     }
 }

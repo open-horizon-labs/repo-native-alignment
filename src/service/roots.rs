@@ -349,6 +349,13 @@ fn list_roots_from_slugs_with_report_recovery(
                 ));
             }
 
+            // Skipped-file census (#895): every candidate file, classified
+            // and accounted for, read straight from persisted scan state so
+            // it renders even outside a live scan/server session.
+            if let Some(census_line) = render_files_census_line(repo_root, &r.path, &r.slug) {
+                line.push_str(&format!("\n  {census_line}"));
+            }
+
             // Encoding stats line — show files skipped or lossy-decoded.
             if let Some(stats) = scan_stats
                 && let Some(enc) = stats.encoding_stats.get(&r.slug)
@@ -518,6 +525,298 @@ fn format_duration(d: std::time::Duration) -> String {
             format!("{}m {}s", mins, remaining)
         }
     }
+}
+
+// ── Skipped-file census (#895) ───────────────────────────────────────
+
+/// Load a root's persisted scan state, mirroring the primary-vs-declared
+/// path split `bg_scanner::scan_roots` uses when constructing each root's
+/// `Scanner` (`.oh/.cache/scan-state.json` for the primary root under
+/// `repo_root`, `~/.local/share/rna/cache/{slug}/scan-state.json` otherwise).
+fn load_root_scan_state(
+    repo_root: &Path,
+    root_path: &Path,
+    root_slug: &str,
+) -> Option<crate::scanner::ScanState> {
+    let path = if root_path == repo_root {
+        crate::scanner::primary_state_path(repo_root)
+    } else {
+        crate::roots::cache_state_path(root_slug)
+    };
+    crate::scanner::load_scan_state_from_path(&path)
+}
+
+/// Render the `Files:` census line for one root: every candidate file the
+/// scan walk has seen, classified into exactly one bucket, with the
+/// invariant spelled out so it is checkable. Returns `None` if the root has
+/// never been scanned (no persisted state yet).
+fn render_files_census_line(repo_root: &Path, root_path: &Path, root_slug: &str) -> Option<String> {
+    use crate::scanner::FileClass;
+
+    let state = load_root_scan_state(repo_root, root_path, root_slug)?;
+
+    // Scan state written before the census exists has tracked files but no
+    // classifications. Rendering an equation from it would claim zero indexed
+    // files; say what is actually true instead. `Scanner::scan` forces one
+    // full re-extraction for exactly this state.
+    if state.census_version < crate::scanner::CENSUS_STATE_VERSION && !state.file_mtimes.is_empty()
+    {
+        return Some(format!(
+            "Files: census pending for {} tracked file(s) -- scan state predates the census; the next scan re-extracts and fills it in",
+            state.file_mtimes.len()
+        ));
+    }
+
+    let mut indexed = 0usize;
+    let mut binary_skipped = 0usize;
+    let mut no_extractor = 0usize;
+    let mut extractor_error = 0usize;
+    for classification in state.file_classifications.values() {
+        match classification.class {
+            FileClass::Indexed => indexed += 1,
+            FileClass::BinarySkipped => binary_skipped += 1,
+            FileClass::NoExtractor => no_extractor += 1,
+            FileClass::ExtractorError => extractor_error += 1,
+        }
+    }
+    let excluded_by_config = state.excluded_by_config_census.count;
+    let has_git = git2::Repository::open(root_path).is_ok();
+    // A root that lost its `.git` after the last scan still carries the old
+    // persisted count until the next scan commits a refreshed zero census;
+    // the line says "no .git", so the total must agree with it.
+    let git_ignored = if has_git {
+        state.git_ignored_census.count
+    } else {
+        0
+    };
+
+    let total = indexed
+        + binary_skipped
+        + no_extractor
+        + extractor_error
+        + excluded_by_config
+        + git_ignored;
+
+    let mut parts = vec![format!("{indexed} indexed")];
+    if excluded_by_config > 0 {
+        parts.push(format!("{excluded_by_config} excluded (config)"));
+    }
+    if !has_git {
+        parts.push("0 git-ignored (no .git)".to_string());
+    } else if git_ignored > 0 {
+        parts.push(format!("{git_ignored} git-ignored"));
+    }
+    if binary_skipped > 0 {
+        parts.push(format!("{binary_skipped} binary"));
+    }
+    if no_extractor > 0 {
+        parts.push(format!("{no_extractor} no extractor"));
+    }
+    if extractor_error > 0 {
+        parts.push(format!("{extractor_error} extractor errors"));
+    }
+
+    let mut line = format!("Files: {total} seen = {}", parts.join(" + "));
+    // Pruned directories are outside the equation: they were never
+    // candidates, so their contents are neither seen nor counted (#895).
+    let pruned_total = state.pruned_dirs_by_config.count + state.pruned_dirs_git_ignored.count;
+    if pruned_total > 0 {
+        let describe = |census: &crate::scanner::ClassCensus| -> String {
+            let shown: Vec<String> = census
+                .samples
+                .iter()
+                .take(3)
+                .map(|p| format!("{}/", p.display()))
+                .collect();
+            let more = census.count.saturating_sub(shown.len());
+            if more > 0 {
+                format!("{} +{} more", shown.join(", "), more)
+            } else {
+                shown.join(", ")
+            }
+        };
+        let mut reasons = Vec::new();
+        if state.pruned_dirs_by_config.count > 0 {
+            reasons.push(format!(
+                "config: {}",
+                describe(&state.pruned_dirs_by_config)
+            ));
+        }
+        if state.pruned_dirs_git_ignored.count > 0 {
+            reasons.push(format!(
+                "git-ignored: {}",
+                describe(&state.pruned_dirs_git_ignored)
+            ));
+        }
+        let noun = if pruned_total == 1 {
+            "directory"
+        } else {
+            "directories"
+        };
+        line.push_str(&format!(
+            "; {pruned_total} {noun} pruned by exclude ({}), contents not enumerated",
+            reasons.join("; ")
+        ));
+    }
+    Some(line)
+}
+
+/// One class of the skipped-file census, for the on-demand detail view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CensusClass {
+    Indexed,
+    ExcludedByConfig,
+    GitIgnored,
+    BinarySkipped,
+    NoExtractor,
+    ExtractorError,
+}
+
+impl CensusClass {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "indexed" => Some(Self::Indexed),
+            "excluded_by_config" | "excluded" | "config" => Some(Self::ExcludedByConfig),
+            "git_ignored" | "gitignored" | "git-ignored" => Some(Self::GitIgnored),
+            "binary_skipped" | "binary" => Some(Self::BinarySkipped),
+            "no_extractor" => Some(Self::NoExtractor),
+            "extractor_error" | "extractor_errors" => Some(Self::ExtractorError),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::ExcludedByConfig => "excluded_by_config",
+            Self::GitIgnored => "git_ignored",
+            Self::BinarySkipped => "binary_skipped",
+            Self::NoExtractor => "no_extractor",
+            Self::ExtractorError => "extractor_error",
+        }
+    }
+}
+
+/// On-demand detail view for the skipped-file census (#895): the files in
+/// one class, bounded, with a "+M more" tail. Reachable from CLI/MCP via
+/// `search(mode="skipped", census_class=...)`.
+///
+/// `limit` bounds how many paths are printed (the persisted sample is
+/// already capped at `CENSUS_SAMPLE_CAP`, so this can only narrow further).
+pub fn render_census_detail(
+    repo_root: &Path,
+    active_slugs: &std::collections::HashSet<String>,
+    class: CensusClass,
+    limit: usize,
+) -> String {
+    use crate::scanner::FileClass;
+
+    let workspace = crate::roots::WorkspaceConfig::load()
+        .with_primary_root(repo_root.to_path_buf())
+        .with_worktrees(repo_root)
+        .with_declared_roots(repo_root);
+    let all_resolved = workspace.resolved_roots();
+    let resolved: Vec<_> = if active_slugs.is_empty() {
+        all_resolved
+    } else {
+        all_resolved
+            .into_iter()
+            .filter(|r| active_slugs.contains(&r.slug))
+            .collect()
+    };
+
+    let mut out = format!("## Skipped-file detail: {}\n\n", class.label());
+    let mut any = false;
+
+    for r in &resolved {
+        let Some(state) = load_root_scan_state(repo_root, &r.path, &r.slug) else {
+            continue;
+        };
+
+        let (count, mut samples): (usize, Vec<(std::path::PathBuf, Option<String>)>) = match class {
+            CensusClass::ExcludedByConfig => {
+                let pruned = &state.pruned_dirs_by_config;
+                let files = &state.excluded_by_config_census;
+                (
+                    pruned.count + files.count,
+                    pruned
+                        .samples
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.clone(),
+                                Some("pruned directory (contents not enumerated)".to_string()),
+                            )
+                        })
+                        .chain(files.samples.iter().map(|p| (p.clone(), None)))
+                        .collect(),
+                )
+            }
+            CensusClass::GitIgnored => {
+                let pruned = &state.pruned_dirs_git_ignored;
+                let files = &state.git_ignored_census;
+                (
+                    pruned.count + files.count,
+                    pruned
+                        .samples
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.clone(),
+                                Some("pruned directory (contents not enumerated)".to_string()),
+                            )
+                        })
+                        .chain(files.samples.iter().map(|p| (p.clone(), None)))
+                        .collect(),
+                )
+            }
+            CensusClass::Indexed
+            | CensusClass::BinarySkipped
+            | CensusClass::NoExtractor
+            | CensusClass::ExtractorError => {
+                let want = match class {
+                    CensusClass::Indexed => FileClass::Indexed,
+                    CensusClass::BinarySkipped => FileClass::BinarySkipped,
+                    CensusClass::NoExtractor => FileClass::NoExtractor,
+                    CensusClass::ExtractorError => FileClass::ExtractorError,
+                    _ => unreachable!(),
+                };
+                let mut matches: Vec<_> = state
+                    .file_classifications
+                    .iter()
+                    .filter(|(_, c)| c.class == want)
+                    .map(|(p, c)| (p.clone(), c.detail.clone()))
+                    .collect();
+                matches.sort_by(|a, b| a.0.cmp(&b.0));
+                (matches.len(), matches)
+            }
+        };
+
+        if count == 0 {
+            continue;
+        }
+        any = true;
+        samples.sort_by(|a, b| a.0.cmp(&b.0));
+        samples.truncate(limit);
+
+        out.push_str(&format!("### {} ({} file(s))\n\n", r.slug, count));
+        for (path, detail) in &samples {
+            match detail {
+                Some(d) => out.push_str(&format!("- `{}` — {}\n", path.display(), d)),
+                None => out.push_str(&format!("- `{}`\n", path.display())),
+            }
+        }
+        if count > samples.len() {
+            out.push_str(&format!("- ... +{} more\n", count - samples.len()));
+        }
+        out.push('\n');
+    }
+
+    if !any {
+        out.push_str("(none)\n");
+    }
+
+    out
 }
 
 /// Format a count with comma thousands separators.
@@ -1656,5 +1955,114 @@ mod tests {
             "global LSP should not show when per-language available, got: {}",
             result
         );
+    }
+
+    // ── Skipped-file census (#895) ───────────────────────────────────────
+
+    /// Runs a real scan + extraction + commit against a fresh tempdir root,
+    /// mirroring the production pipeline, so the persisted `scan-state.json`
+    /// the render functions read from disk is genuine rather than hand-built.
+    fn scan_extract_and_commit(
+        repo: &Path,
+    ) -> (
+        crate::roots::ResolvedRoot,
+        std::collections::HashSet<String>,
+    ) {
+        let mut scanner = crate::scanner::Scanner::new(repo.to_path_buf()).unwrap();
+        let scan = scanner.scan().unwrap();
+        let registry = crate::extract::ExtractorRegistry::with_builtins();
+        let (_, _enc_stats, classifications) =
+            registry.extract_scan_result_with_census(repo, &scan);
+        scanner.apply_file_classifications(classifications);
+        scanner.remove_file_classifications(&scan.deleted_files);
+        scanner.commit_state().unwrap();
+
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.to_path_buf())
+            .with_worktrees(repo)
+            .with_claude_memory(repo)
+            .with_agent_memories(repo)
+            .with_declared_roots(repo);
+        let resolved = workspace.resolved_roots();
+        let primary = resolved.into_iter().next().expect("at least one root");
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary.slug.clone());
+        (primary, active_slugs)
+    }
+
+    /// A non-git root's `Files:` line must report `0 git-ignored (no .git)`,
+    /// mirroring the existing "Co-change: not available (no .git)" pattern,
+    /// rather than silently showing zero with no explanation.
+    #[test]
+    fn files_census_line_notes_no_git_for_non_git_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("main.rs"), "pub fn f() {}\n").unwrap();
+
+        let (_root, active_slugs) = scan_extract_and_commit(repo);
+        let result = list_roots_from_slugs(repo, &active_slugs, None, None, None);
+
+        assert!(
+            result.contains("Files: 1 seen = 1 indexed"),
+            "expected a balanced Files: line, got: {result}"
+        );
+        assert!(
+            result.contains("0 git-ignored (no .git)"),
+            "non-git root must explicitly note git-ignore is unavailable, got: {result}"
+        );
+    }
+
+    /// The `Files:` equation must balance for a root that exercises every
+    /// class: indexed, excluded_by_config, binary_skipped, no_extractor.
+    #[test]
+    fn files_census_line_balances_across_classes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("main.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+        std::fs::write(
+            repo.join("node_modules/pkg/index.js"),
+            "module.exports = {};",
+        )
+        .unwrap();
+        std::fs::write(repo.join("blob.bin"), [0u8, 1, 2, 0, 0]).unwrap();
+        std::fs::write(repo.join("data.mystery"), "opaque").unwrap();
+
+        let (_root, active_slugs) = scan_extract_and_commit(repo);
+        let result = list_roots_from_slugs(repo, &active_slugs, None, None, None);
+
+        let line = result
+            .lines()
+            .find(|l| l.trim_start().starts_with("Files:"))
+            .unwrap_or_else(|| panic!("no Files: line in: {result}"));
+        let (total_str, rest) = line
+            .trim_start()
+            .trim_start_matches("Files: ")
+            .split_once(" seen = ")
+            .unwrap_or_else(|| panic!("unexpected Files: line shape: {line}"));
+        let total: usize = total_str.parse().unwrap();
+        // The pruned-directory note after `;` is outside the equation.
+        let rest = rest.split(';').next().unwrap();
+        let sum: usize = rest
+            .split('+')
+            .map(|term| {
+                term.trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+
+        // node_modules/ is a pruned directory, not a seen file: 3 candidates.
+        assert_eq!(total, 3, "expected 3 candidate files total, line: {line}");
+        assert_eq!(sum, total, "Files: equation must balance, line: {line}");
+        assert!(
+            line.contains("1 directory pruned by exclude (config: node_modules/)"),
+            "line: {line}"
+        );
+        assert!(line.contains("1 binary"), "line: {line}");
+        assert!(line.contains("1 no extractor"), "line: {line}");
     }
 }

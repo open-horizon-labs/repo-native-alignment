@@ -66,6 +66,7 @@ This project IS the RNA MCP server. When working here, use its own tools.
 
 **If RNA returns empty results — diagnose before falling back:**
 - Try a broader query, different `kind`, or no filters first
+- Check `list_roots` for a `Files:` census line: it accounts for every file the scan saw (indexed / excluded by config / git-ignored / binary / no extractor / extractor error), so you can tell "this file is genuinely invisible to the index, and here's why" from "the query was wrong". Pruned directories (`target/`, `node_modules/`) are listed once after the equation rather than having their contents counted. `search(mode="skipped", kind="<class>")` lists the actual files in a class (bounded, with "+M more").
 - Do NOT silently fall back to Grep/Read — that defeats the purpose
 - If the index is genuinely stale, say so explicitly rather than substituting file reads
 

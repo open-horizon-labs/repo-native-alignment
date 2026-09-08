@@ -66,7 +66,8 @@ pub mod yaml_extractor;
 pub mod zig;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
@@ -365,11 +366,38 @@ impl ExtractorRegistry {
     /// Extract nodes and edges from a single file.
     ///
     /// Finds all extractors matching the file's extension and `can_handle()`,
-    /// runs them all, and merges results.
+    /// runs them all, and merges results. Convenience wrapper around
+    /// [`extract_file_classified`](Self::extract_file_classified) that
+    /// discards the skipped-file classification (#895); prefer the
+    /// `_classified` variant when the caller can propagate it to the census.
     pub fn extract_file(&self, path: &Path, content: &str) -> ExtractionResult {
+        self.extract_file_classified(path, content).0
+    }
+
+    /// Extract from a single file, also returning its skipped-file
+    /// classification (#895): `indexed` if at least one extractor produced a
+    /// result, `no_extractor` if the extension is unclaimed or every
+    /// matching extractor declined via `can_handle`, `extractor_error` if a
+    /// matching, non-declining extractor's `extract()` returned `Err` and no
+    /// other extractor succeeded.
+    ///
+    /// A mixed outcome (one extractor succeeds, another on the same file
+    /// errors or declines) is `indexed`: the file's content did make it into
+    /// the graph, so it is not "invisible".
+    pub fn extract_file_classified(
+        &self,
+        path: &Path,
+        content: &str,
+    ) -> (ExtractionResult, crate::scanner::FileClassification) {
+        use crate::scanner::{FileClass, FileClassification};
+
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let mut result = ExtractionResult::default();
+        let mut extension_claimed = false;
+        let mut any_success = false;
+        let mut decliners: Vec<&str> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
 
         for extractor in &self.extractors {
             let extensions = extractor.extensions();
@@ -377,14 +405,31 @@ impl ExtractorRegistry {
             // filename family (for example Dockerfile and Dockerfile.*).
             // Let its can_handle predicate make that deterministic decision
             // even when a variant has a syntactic suffix.
-            if !extensions.contains(&ext) && !extensions.contains(&"") {
+            // An extension-less file (`LICENSE`, `.gitignore`) matches the
+            // empty-extension wildcard only; that is a probe, not a claim.
+            let listed = !ext.is_empty() && extensions.contains(&ext);
+            if !listed && !extensions.contains(&"") {
                 continue;
             }
+            // Only a *listed* extension counts as a claim for the census. The
+            // empty-extension wildcard is a filename-family probe (Dockerfile,
+            // Dockerfile.*); when it declines, `Cargo.lock` or `LICENSE` must
+            // read as "no extractor claims it", not "claimed but declined by
+            // dockerfile-tree-sitter" (misleading label seen in the live run).
+            if listed {
+                extension_claimed = true;
+            }
             if !extractor.can_handle(path, content) {
+                if listed {
+                    decliners.push(extractor.name());
+                }
                 continue;
             }
             match extractor.extract(path, content) {
-                Ok(extraction) => result.merge(extraction),
+                Ok(extraction) => {
+                    result.merge(extraction);
+                    any_success = true;
+                }
                 Err(e) => {
                     tracing::warn!(
                         "Extractor {} failed on {}: {}",
@@ -392,11 +437,41 @@ impl ExtractorRegistry {
                         path.display(),
                         e
                     );
+                    errors.push(format!("{}: {}", extractor.name(), e));
                 }
             }
         }
 
-        result
+        let classification = if any_success {
+            FileClassification {
+                class: FileClass::Indexed,
+                detail: None,
+            }
+        } else if !errors.is_empty() {
+            FileClassification {
+                class: FileClass::ExtractorError,
+                detail: Some(errors.join("; ")),
+            }
+        } else if !extension_claimed {
+            FileClassification {
+                class: FileClass::NoExtractor,
+                detail: Some(if ext.is_empty() {
+                    "no extension; no extractor claims it".to_string()
+                } else {
+                    format!(".{ext} is not claimed by any registered extractor")
+                }),
+            }
+        } else {
+            FileClassification {
+                class: FileClass::NoExtractor,
+                detail: Some(format!(
+                    "extension claimed but declined by can_handle: {}",
+                    decliners.join(", ")
+                )),
+            }
+        };
+
+        (result, classification)
     }
 
     /// Extract from all files in a scan result.
@@ -430,6 +505,38 @@ impl ExtractorRegistry {
         repo_root: &Path,
         scan_result: &ScanResult,
     ) -> (ExtractionResult, EncodingStats) {
+        let (result, stats, _classifications) =
+            self.extract_scan_result_with_census(repo_root, scan_result);
+        (result, stats)
+    }
+
+    /// Extract from all files in a scan result, returning the extraction
+    /// result, encoding statistics, and a skipped-file classification (#895)
+    /// for every changed+new file processed. Callers merge the
+    /// classification map into the persisted `Scanner` state (unchanged
+    /// files keep their prior classification, so the census reflects the
+    /// full population on incremental scans, not just the delta).
+    ///
+    /// Files are processed in parallel using rayon. Each file is independent —
+    /// no shared mutable state — so parallelism is safe. On a 10-core machine
+    /// a 500-file scan drops from ~10s to ~1s.
+    ///
+    /// Files that are valid UTF-8 are extracted directly. Files that fail UTF-8
+    /// validation are content-sniffed: truly binary files (null bytes or high
+    /// control-char ratio) are skipped; text files with wrong encoding (Latin-1,
+    /// Windows-1252) are lossy-decoded with U+FFFD replacement characters so
+    /// their symbols still appear in the index.
+    pub fn extract_scan_result_with_census(
+        &self,
+        repo_root: &Path,
+        scan_result: &ScanResult,
+    ) -> (
+        ExtractionResult,
+        EncodingStats,
+        std::collections::HashMap<PathBuf, crate::scanner::FileClassification>,
+    ) {
+        use crate::scanner::{FileClass, FileClassification};
+
         // Process changed + new files (not deleted ones)
         let files_to_process: Vec<_> = scan_result
             .changed_files
@@ -445,6 +552,10 @@ impl ExtractorRegistry {
 
         let binary_skipped = AtomicUsize::new(0);
         let lossy_decoded = AtomicUsize::new(0);
+        let classifications: Mutex<std::collections::HashMap<PathBuf, FileClassification>> =
+            Mutex::new(std::collections::HashMap::with_capacity(
+                files_to_process.len(),
+            ));
 
         let result = files_to_process
             .into_par_iter()
@@ -464,6 +575,13 @@ impl ExtractorRegistry {
                 if is_binary_content(&raw_bytes) {
                     tracing::debug!("Skipping binary file {}", abs_path.display());
                     binary_skipped.fetch_add(1, Ordering::Relaxed);
+                    classifications.lock().unwrap().insert(
+                        rel_path.clone(),
+                        FileClassification {
+                            class: FileClass::BinarySkipped,
+                            detail: None,
+                        },
+                    );
                     return None;
                 }
 
@@ -477,7 +595,12 @@ impl ExtractorRegistry {
                     }
                 };
 
-                let file_result = self.extract_file(rel_path, &content);
+                let (file_result, classification) =
+                    self.extract_file_classified(rel_path, &content);
+                classifications
+                    .lock()
+                    .unwrap()
+                    .insert(rel_path.clone(), classification);
                 tracing::debug!(
                     "ExtractorRegistry: extracted {} -> {} node(s), {} edge(s) in {:?}",
                     rel_path.display(),
@@ -508,7 +631,11 @@ impl ExtractorRegistry {
             lossy_decoded: lossy_count,
         };
 
-        (result, stats)
+        (
+            result,
+            stats,
+            classifications.into_inner().unwrap_or_default(),
+        )
     }
 
     /// Number of registered extractors.
@@ -1503,5 +1630,258 @@ mod tests {
             "Mixed encoding should be lossy-decoded"
         );
         assert_eq!(stats.binary_skipped, 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Skipped-file census (#895)
+    // ---------------------------------------------------------------------------
+
+    /// Always succeeds: extension `idx`, `can_handle` true, `extract` Ok.
+    struct AlwaysIndexes;
+    impl Extractor for AlwaysIndexes {
+        fn extensions(&self) -> &[&str] {
+            &["idx"]
+        }
+        fn name(&self) -> &str {
+            "test-always-indexes"
+        }
+        fn extract(&self, path: &Path, _content: &str) -> Result<ExtractionResult> {
+            Ok(ExtractionResult {
+                nodes: vec![Node {
+                    id: crate::graph::NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: "indexed_marker".to_string(),
+                        kind: crate::graph::NodeKind::Other("test".to_string()),
+                    },
+                    language: "test".to_string(),
+                    line_start: 1,
+                    line_end: 1,
+                    signature: String::new(),
+                    body: String::new(),
+                    metadata: BTreeMap::new(),
+                    source: crate::graph::ExtractionSource::TreeSitter,
+                }],
+                edges: vec![],
+            })
+        }
+    }
+
+    /// Claims extension `declined` but always declines via `can_handle`.
+    struct AlwaysDeclines;
+    impl Extractor for AlwaysDeclines {
+        fn extensions(&self) -> &[&str] {
+            &["declined"]
+        }
+        fn can_handle(&self, _path: &Path, _content: &str) -> bool {
+            false
+        }
+        fn name(&self) -> &str {
+            "test-always-declines"
+        }
+        fn extract(&self, _path: &Path, _content: &str) -> Result<ExtractionResult> {
+            unreachable!("can_handle is always false; extract must not be called")
+        }
+    }
+
+    /// Claims extension `err`, `can_handle` true, `extract` always fails.
+    struct AlwaysErrors;
+    impl Extractor for AlwaysErrors {
+        fn extensions(&self) -> &[&str] {
+            &["err"]
+        }
+        fn name(&self) -> &str {
+            "test-always-errors"
+        }
+        fn extract(&self, path: &Path, _content: &str) -> Result<ExtractionResult> {
+            anyhow::bail!("synthetic extractor failure for {}", path.display())
+        }
+    }
+
+    /// #895: `extract_file_classified` must produce exactly one of the four
+    /// extraction-side classes per file, matching the fixture's intent.
+    #[test]
+    fn extract_file_classified_covers_every_extraction_class() {
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(AlwaysIndexes));
+        registry.register(Box::new(AlwaysDeclines));
+        registry.register(Box::new(AlwaysErrors));
+
+        let (_, indexed) = registry.extract_file_classified(Path::new("a.idx"), "content");
+        assert_eq!(indexed.class, crate::scanner::FileClass::Indexed);
+
+        let (_, declined) = registry.extract_file_classified(Path::new("b.declined"), "content");
+        assert_eq!(declined.class, crate::scanner::FileClass::NoExtractor);
+        assert!(
+            declined
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("test-always-declines"),
+            "declined detail should name the declining extractor: {:?}",
+            declined.detail
+        );
+
+        let (_, errored) = registry.extract_file_classified(Path::new("c.err"), "content");
+        assert_eq!(errored.class, crate::scanner::FileClass::ExtractorError);
+        assert!(
+            errored
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("synthetic extractor failure"),
+            "error detail should include the extractor's error: {:?}",
+            errored.detail
+        );
+
+        let (_, unclaimed) =
+            registry.extract_file_classified(Path::new("d.nothingclaims"), "content");
+        assert_eq!(unclaimed.class, crate::scanner::FileClass::NoExtractor);
+        assert!(
+            unclaimed.detail.as_deref().unwrap().contains("not claimed"),
+            "unclaimed detail should say so: {:?}",
+            unclaimed.detail
+        );
+    }
+
+    /// #895: the full six-class invariant on a tempdir fixture covering every
+    /// class: `population = indexed + excluded_by_config + git_ignored +
+    /// binary_skipped + no_extractor + extractor_error`. Combines the
+    /// walk-level census (`Scanner::scan`) with the extraction-level census
+    /// (`extract_scan_result_with_census`), exactly as `list_roots` does.
+    #[test]
+    fn skipped_file_census_covers_every_class_and_balances() {
+        use crate::scanner::{FileClass, Scanner};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // indexed: a real Rust file the builtin registry extracts.
+        std::fs::write(root.join("main.rs"), "pub fn real_fn() {}\n").unwrap();
+        // excluded_by_config: default-excluded directory (node_modules/).
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg/index.js"),
+            "module.exports = {};\n",
+        )
+        .unwrap();
+        // binary_skipped: null byte makes it binary content.
+        std::fs::write(root.join("blob.bin"), [0u8, 1, 2, 3, 0, 0]).unwrap();
+        // no_extractor: extension nobody claims.
+        std::fs::write(root.join("data.mystery"), "opaque content\n").unwrap();
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let scan = scanner.scan().unwrap();
+
+        assert_eq!(
+            scanner.excluded_by_config_census().count,
+            0,
+            "files under a pruned directory are never enumerated or counted"
+        );
+        assert_eq!(
+            scanner.pruned_dirs_by_config().count,
+            1,
+            "node_modules/ should be recorded once as a pruned directory"
+        );
+        assert_eq!(
+            scanner.git_ignored_census().count,
+            0,
+            "no .git in this fixture, so git_ignored must be 0"
+        );
+
+        let registry = ExtractorRegistry::with_builtins();
+        let (_, enc_stats, classifications) = registry.extract_scan_result_with_census(root, &scan);
+
+        let indexed = classifications
+            .values()
+            .filter(|c| c.class == FileClass::Indexed)
+            .count();
+        let no_extractor = classifications
+            .values()
+            .filter(|c| c.class == FileClass::NoExtractor)
+            .count();
+        let extractor_error = classifications
+            .values()
+            .filter(|c| c.class == FileClass::ExtractorError)
+            .count();
+
+        assert_eq!(indexed, 1, "main.rs should be indexed");
+        assert_eq!(
+            enc_stats.binary_skipped, 1,
+            "blob.bin should be binary_skipped"
+        );
+        assert_eq!(no_extractor, 1, "data.mystery should be no_extractor");
+        assert_eq!(extractor_error, 0, "no fixture file should error");
+
+        let population = indexed
+            + enc_stats.binary_skipped
+            + no_extractor
+            + extractor_error
+            + scanner.excluded_by_config_census().count
+            + scanner.git_ignored_census().count;
+        assert_eq!(
+            population, 3,
+            "population must equal the sum of every class exactly once (#895 invariant); \
+             node_modules/ is a pruned directory and contributes no seen files"
+        );
+    }
+
+    /// #895: an incremental scan must report the FULL current population, not
+    /// just the delta. A second scan that only touches one file must still
+    /// carry forward the first scan's classification for the untouched file.
+    #[test]
+    fn incremental_scan_reports_full_population_not_delta() {
+        use crate::scanner::{FileClass, Scanner};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub fn b() {}\n").unwrap();
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let scan = scanner.scan().unwrap();
+        let registry = ExtractorRegistry::with_builtins();
+        let (_, _, classifications) = registry.extract_scan_result_with_census(root, &scan);
+        scanner.apply_file_classifications(classifications);
+        scanner.remove_file_classifications(&scan.deleted_files);
+        scanner.commit_state().unwrap();
+
+        assert_eq!(
+            scanner
+                .file_classifications()
+                .values()
+                .filter(|c| c.class == FileClass::Indexed)
+                .count(),
+            2,
+            "both files should be indexed after the first scan"
+        );
+
+        // Second scan: only b.rs changes. a.rs is untouched.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(root.join("b.rs"), "pub fn b() { /* v2 */ }\n").unwrap();
+
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let scan2 = scanner2.scan().unwrap();
+        assert_eq!(
+            scan2.changed_files.len() + scan2.new_files.len(),
+            1,
+            "only b.rs should be in this scan's delta"
+        );
+        let (_, _, classifications2) = registry.extract_scan_result_with_census(root, &scan2);
+        scanner2.apply_file_classifications(classifications2);
+        scanner2.remove_file_classifications(&scan2.deleted_files);
+
+        // The incremental scan's classification map (merged, not replaced)
+        // must still report BOTH files as indexed -- the full population --
+        // even though only one file was in this scan's delta.
+        let indexed_after_incremental = scanner2
+            .file_classifications()
+            .values()
+            .filter(|c| c.class == FileClass::Indexed)
+            .count();
+        assert_eq!(
+            indexed_after_incremental, 2,
+            "incremental scan must report the full population (both files), not just the 1-file delta"
+        );
     }
 }

@@ -2098,9 +2098,14 @@ impl RnaHandler {
         // The outer foreground bus below is the sole LSP owner for an
         // incremental target. The graph update still performs extraction and
         // structural post-passes, but cannot execute the same LSP plan twice.
-        let _incremental_update = self
+        let incremental_update = self
             .update_graph_with_scan_outcome(&mut cached_state, Some(scan), enrichment.without_lsp())
             .await?;
+        // Skipped-file census (#895): this function owns `scanner` (created
+        // above) and commits it below, so merge in the classifications
+        // `update_graph_with_scan_outcome` computed for changed+new files.
+        scanner.apply_file_classifications(incremental_update.file_classifications);
+        scanner.remove_file_classifications(&incremental_update.deleted_files);
         let cache_plan = if let Some(authorization) = cache_authorization.as_ref() {
             let plan = crate::structural_cache::plan_incremental_impact(
                 authorization,
