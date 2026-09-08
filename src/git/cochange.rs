@@ -63,6 +63,10 @@ pub struct CoChangeMiningResult {
     /// Number of commits actually walked (after age/count bounding, before the
     /// per-commit file-count cutoff).
     pub commits_walked: usize,
+    /// Per-file commit counts within the mined window -- "churn" (#889). This is
+    /// the same map already built to compute `CoChangePair::changes_a/changes_b`;
+    /// surfaced here rather than discarded so callers can render it directly.
+    pub file_changes: HashMap<PathBuf, u32>,
 }
 
 /// One mined file pair with its co-change stats.
@@ -224,6 +228,7 @@ pub fn mine_cochanges(
         pairs,
         head_sha,
         commits_walked,
+        file_changes,
     })
 }
 
@@ -276,12 +281,18 @@ pub fn build_cochange_edges(
 }
 
 /// Emit one `NodeKind::Other("file")` anchor node per unique file referenced
-/// by `pairs`, skipping files that already have a node in `existing_stable_ids`
-/// (dedup by stable ID -- avoids duplicate virtual anchors on rescans or when
-/// another pass already anchors that exact file).
+/// by `pairs` or with a non-zero entry in `file_changes` (#889 -- churn needs
+/// an anchor on every changed file, not only files that appear in a
+/// co-change pair), skipping files that already have a node in
+/// `existing_stable_ids` (dedup by stable ID -- avoids duplicate virtual
+/// anchors on rescans or when another pass already anchors that exact file).
+///
+/// Anchors for files with known churn carry a `churn` metadata key (total
+/// commits touching that file within the mined window).
 pub fn build_file_anchor_nodes(
     root_id: &str,
     pairs: &[CoChangePair],
+    file_changes: &HashMap<PathBuf, u32>,
     existing_stable_ids: &HashSet<String>,
 ) -> Vec<crate::graph::Node> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -292,6 +303,9 @@ pub fn build_file_anchor_nodes(
         files.push(&pair.file_a);
         files.push(&pair.file_b);
     }
+    for file in file_changes.keys() {
+        files.push(file);
+    }
 
     for file in files {
         if !seen.insert(file.clone()) {
@@ -300,6 +314,12 @@ pub fn build_file_anchor_nodes(
         let id = file_anchor_node_id(root_id, file);
         if existing_stable_ids.contains(&id.to_stable_id()) {
             continue;
+        }
+        let mut metadata = std::collections::BTreeMap::new();
+        if let Some(churn) = file_changes.get(file)
+            && *churn > 0
+        {
+            metadata.insert("churn".to_string(), churn.to_string());
         }
         nodes.push(crate::graph::Node {
             id,
@@ -312,7 +332,7 @@ pub fn build_file_anchor_nodes(
             line_end: 0,
             signature: format!("file {}", file.display()),
             body: String::new(),
-            metadata: std::collections::BTreeMap::new(),
+            metadata,
             source: ExtractionSource::Git,
         });
     }
@@ -395,9 +415,15 @@ pub fn resolve_changed_file_set(repo_root: &Path, scope: &str) -> Result<HashSet
 }
 
 /// Result of [`mine_and_build`]: file anchor nodes, `CoChanges` edges, the
-/// stable-id-keyed stats map for those edges, and the HEAD SHA mined (for the
-/// caller to update the watermark).
-pub type MineAndBuildResult = (Vec<crate::graph::Node>, Vec<Edge>, CoChangeStatsMap, Option<String>);
+/// stable-id-keyed stats map for those edges, the HEAD SHA mined (for the
+/// caller to update the watermark), and the per-file churn map (#889).
+pub type MineAndBuildResult = (
+    Vec<crate::graph::Node>,
+    Vec<Edge>,
+    CoChangeStatsMap,
+    Option<String>,
+    HashMap<PathBuf, u32>,
+);
 
 /// Convenience wrapper: mine, then build file anchor nodes and `CoChanges`
 /// edges and stats map in one call.
@@ -413,9 +439,14 @@ pub fn mine_and_build(
     existing_stable_ids: &HashSet<String>,
 ) -> Result<MineAndBuildResult> {
     let result = mine_cochanges(repo_root, config, since_sha)?;
-    let nodes = build_file_anchor_nodes(root_id, &result.pairs, existing_stable_ids);
+    let nodes = build_file_anchor_nodes(
+        root_id,
+        &result.pairs,
+        &result.file_changes,
+        existing_stable_ids,
+    );
     let (edges, stats) = build_cochange_edges(root_id, &result.pairs);
-    Ok((nodes, edges, stats, result.head_sha))
+    Ok((nodes, edges, stats, result.head_sha, result.file_changes))
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +533,11 @@ mod tests {
             changes_a: 4,
             changes_b: 4,
         }];
-        let nodes = build_file_anchor_nodes("repo", &pairs, &HashSet::new());
+        let file_changes = HashMap::from([
+            (PathBuf::from("src/a.rs"), 4u32),
+            (PathBuf::from("src/b.rs"), 4u32),
+        ]);
+        let nodes = build_file_anchor_nodes("repo", &pairs, &file_changes, &HashSet::new());
         assert_eq!(nodes.len(), 2);
         for node in &nodes {
             assert!(
@@ -690,7 +725,12 @@ mod tests {
                 changes_b: 1,
             },
         ];
-        let nodes = build_file_anchor_nodes("repo", &pairs, &HashSet::new());
+        let file_changes = HashMap::from([
+            (PathBuf::from("a.rs"), 2u32),
+            (PathBuf::from("b.rs"), 1u32),
+            (PathBuf::from("c.rs"), 1u32),
+        ]);
+        let nodes = build_file_anchor_nodes("repo", &pairs, &file_changes, &HashSet::new());
         // a.rs, b.rs, c.rs -- three unique files, "a.rs" not duplicated.
         assert_eq!(nodes.len(), 3);
     }
@@ -704,11 +744,69 @@ mod tests {
             changes_a: 1,
             changes_b: 1,
         }];
+        let file_changes =
+            HashMap::from([(PathBuf::from("a.rs"), 1u32), (PathBuf::from("b.rs"), 1u32)]);
         let existing_id = file_anchor_node_id("repo", Path::new("a.rs")).to_stable_id();
         let mut existing = HashSet::new();
         existing.insert(existing_id);
-        let nodes = build_file_anchor_nodes("repo", &pairs, &existing);
+        let nodes = build_file_anchor_nodes("repo", &pairs, &file_changes, &existing);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].id.file, PathBuf::from("b.rs"));
+    }
+
+    #[test]
+    fn test_mine_cochanges_reports_file_changes_for_solo_commits() {
+        // #889: file_changes must count every commit touching a file, including
+        // single-file commits that never form a co-change pair.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+
+        commit_files(&repo, dir, &[("a.rs", "1"), ("b.rs", "1")], "first: a+b");
+        commit_files(&repo, dir, &[("a.rs", "2")], "second: a alone");
+        commit_files(&repo, dir, &[("c.rs", "1")], "third: c alone");
+
+        let config = CoChangeConfig::default();
+        let result = mine_cochanges(dir, &config, None).expect("mine");
+
+        assert_eq!(result.file_changes.get(&PathBuf::from("a.rs")), Some(&2));
+        assert_eq!(result.file_changes.get(&PathBuf::from("b.rs")), Some(&1));
+        assert_eq!(result.file_changes.get(&PathBuf::from("c.rs")), Some(&1));
+    }
+
+    #[test]
+    fn test_build_file_anchor_nodes_covers_unpaired_churned_files() {
+        // #889: a file with churn but no co-change partner still gets an
+        // anchor node carrying its churn metadata.
+        let pairs: Vec<CoChangePair> = Vec::new();
+        let file_changes = HashMap::from([(PathBuf::from("solo.rs"), 7u32)]);
+        let nodes = build_file_anchor_nodes("repo", &pairs, &file_changes, &HashSet::new());
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id.file, PathBuf::from("solo.rs"));
+        assert_eq!(
+            nodes[0].metadata.get("churn").map(String::as_str),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn test_build_file_anchor_nodes_zero_churn_gets_no_metadata() {
+        // A file with a zero entry in file_changes (shouldn't normally occur,
+        // but defensive) gets an anchor without a churn key rather than "0".
+        let pairs = vec![CoChangePair {
+            file_a: PathBuf::from("a.rs"),
+            file_b: PathBuf::from("b.rs"),
+            support: 1,
+            changes_a: 1,
+            changes_b: 1,
+        }];
+        let file_changes =
+            HashMap::from([(PathBuf::from("a.rs"), 1u32), (PathBuf::from("b.rs"), 0u32)]);
+        let nodes = build_file_anchor_nodes("repo", &pairs, &file_changes, &HashSet::new());
+        let b_node = nodes
+            .iter()
+            .find(|n| n.id.file == PathBuf::from("b.rs"))
+            .expect("b.rs anchor present");
+        assert!(b_node.metadata.get("churn").is_none());
     }
 }

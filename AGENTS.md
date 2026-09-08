@@ -75,7 +75,7 @@ This project IS the RNA MCP server. When working here, use its own tools.
 1. `search` -- all-in-one: code symbols, .oh/ artifacts, commits, markdown, and graph traversal
 2. `outcome_progress` -- structural join for outcome tracking
 3. `list_roots` -- workspace root management
-4. `repo_map` -- repository orientation (top symbols, hotspots, outcomes, entry points)
+4. `repo_map` -- repository orientation (top symbols, hotspots ranked by churn x complexity, outcomes, entry points)
 
 **Writing business artifacts:** Write directly to `.oh/` using the Write tool. See `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` for frontmatter templates.
 

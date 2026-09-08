@@ -405,6 +405,9 @@ pub(crate) fn format_node_entry_with_root(
         if let Some(cc) = n.metadata.get("cyclomatic") {
             entry.push_str(&format!(" cc:{}", cc));
         }
+        if let Some(churn) = n.metadata.get("churn") {
+            entry.push_str(&format!(" churn:{}", churn));
+        }
         if let Some(imp) = n.metadata.get("importance")
             && let Ok(score) = imp.parse::<f64>()
             && score > IMPORTANCE_THRESHOLD
@@ -514,6 +517,9 @@ pub(crate) fn format_node_entry_with_root(
         }
         if let Some(cc) = n.metadata.get("cyclomatic") {
             entry.push_str(&format!("\n  Complexity: {}", cc));
+        }
+        if let Some(churn) = n.metadata.get("churn") {
+            entry.push_str(&format!("\n  Churn: {}", churn));
         }
         if let Some(imp) = n.metadata.get("importance")
             && let Ok(score) = imp.parse::<f64>()

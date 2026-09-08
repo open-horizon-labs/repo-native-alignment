@@ -321,7 +321,15 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
         }
     }
     {
-        let mut fc: std::collections::HashMap<(String, String), usize> =
+        // Hotspot files (#889): ranked by churn x aggregate complexity, not
+        // raw definition count (a size proxy previously printed under a risk
+        // label -- see issue #889/#888). Churn = commits touching the file
+        // within co-change mining's bounded window (`file_changes`, stamped
+        // as `churn` metadata on the file's `NodeKind::Other("file")` anchor
+        // node). Complexity = summed `cyclomatic` over the file's
+        // non-excluded symbols (same complexity signal already rendered
+        // elsewhere -- see `server/helpers.rs`).
+        let mut complexity_by_file: std::collections::HashMap<(String, String), i64> =
             std::collections::HashMap::new();
         for n in &graph_state.nodes {
             if matches!(
@@ -336,17 +344,82 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             if !node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs) {
                 continue;
             }
-            *fc.entry((n.id.root.clone(), n.id.file.display().to_string()))
-                .or_default() += 1;
+            let cc: i64 = n
+                .metadata
+                .get("cyclomatic")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            // `or_default()` ensures the file appears in the ranking even when
+            // every one of its non-excluded nodes has zero complexity (e.g. a
+            // file of plain structs/consts) -- an explicit zero, not absence.
+            *complexity_by_file
+                .entry((n.id.root.clone(), n.id.file.display().to_string()))
+                .or_default() += cc;
         }
-        let mut sf: Vec<_> = fc.into_iter().collect();
-        sf.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-        sf.truncate(10);
+
+        // Co-change mining (and therefore churn) only ever runs against the
+        // single primary/mined root, mirroring `search.rs`'s mode="cochange"
+        // and `roots.rs`'s availability line. Files on any other root, or any
+        // root with no `.git`, have no churn signal -- state that explicitly
+        // rather than implying churn 0 (#889).
+        let mined_root = crate::roots::RootConfig::code_project(ctx.repo_root.to_path_buf()).slug();
+        let git_available = git2::Repository::open(ctx.repo_root).is_ok();
+        let mut churn_by_file: std::collections::HashMap<(String, String), u32> =
+            std::collections::HashMap::new();
+        for n in &graph_state.nodes {
+            if let NodeKind::Other(kind) = &n.id.kind
+                && kind == "file"
+                && let Some(churn) = n.metadata.get("churn").and_then(|s| s.parse::<u32>().ok())
+            {
+                churn_by_file.insert((n.id.root.clone(), n.id.file.display().to_string()), churn);
+            }
+        }
+
+        enum ChurnBasis {
+            /// Churn known for this file's root (0 is a real, in-window count,
+            /// not "unknown").
+            Known(u32),
+            /// No churn signal for this file -- reason stated in the output.
+            Unavailable(&'static str),
+        }
+
+        let mut hotspots: Vec<(String, String, ChurnBasis, i64, f64)> = complexity_by_file
+            .into_iter()
+            .map(|((root, file), complexity)| {
+                let basis = if root != mined_root {
+                    ChurnBasis::Unavailable("root not mined for co-change/churn")
+                } else if !git_available {
+                    ChurnBasis::Unavailable("no .git")
+                } else {
+                    let churn = churn_by_file
+                        .get(&(root.clone(), file.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    ChurnBasis::Known(churn)
+                };
+                let score = match &basis {
+                    ChurnBasis::Known(churn) => *churn as f64 * complexity as f64,
+                    ChurnBasis::Unavailable(_) => 0.0,
+                };
+                (root, file, basis, complexity, score)
+            })
+            .collect();
+
+        // Rank by score desc; ties (including all-zero-score files) break
+        // deterministically by file path then root.
+        hotspots.sort_by(|a, b| {
+            b.4.partial_cmp(&a.4)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        hotspots.truncate(10);
+
         let single_root = params.root_filter.is_some();
-        if !sf.is_empty() {
-            let md: String = sf
+        if !hotspots.is_empty() {
+            let md: String = hotspots
                 .iter()
-                .map(|((root, f), count)| {
+                .map(|(root, f, basis, complexity, score)| {
                     // #884: append the strongest git co-change partner, if any,
                     // so agents see "these two files usually change together"
                     // directly in the existing Hotspot files section rather than
@@ -360,18 +433,29 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                                 )
                             })
                             .unwrap_or_default();
+                    let basis_str = match basis {
+                        ChurnBasis::Known(churn) => {
+                            format!("churn {} x complexity {} = {:.0}", churn, complexity, score)
+                        }
+                        ChurnBasis::Unavailable(reason) => {
+                            format!(
+                                "churn: not available ({}); complexity {}",
+                                reason, complexity
+                            )
+                        }
+                    };
                     if single_root {
-                        format!("- `{}` -- {} definitions{}", f, count, cochange_suffix)
+                        format!("- `{}` -- {}{}", f, basis_str, cochange_suffix)
                     } else {
-                        format!(
-                            "- [{}] `{}` -- {} definitions{}",
-                            root, f, count, cochange_suffix
-                        )
+                        format!("- [{}] `{}` -- {}{}", root, f, basis_str, cochange_suffix)
                     }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            sections.push(format!("## Hotspot files\n\n{}", md));
+            sections.push(format!(
+                "## Hotspot files (ranked by churn x complexity: commits in window x summed cyclomatic)\n\n{}",
+                md
+            ));
         }
     }
     if !ctx.business_context.mode().is_disabled() {
@@ -667,5 +751,292 @@ mod tests {
             },
         );
         assert!(!disabled_result.contains("## Active outcomes"));
+    }
+
+    // ── Hotspot files: churn x complexity ranking (#889) ────────────
+
+    fn make_file_anchor(root: &str, file: &str, churn: u32) -> Node {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("churn".to_string(), churn.to_string());
+        Node {
+            id: NodeId {
+                kind: NodeKind::Other("file".to_string()),
+                name: file.to_string(),
+                file: PathBuf::from(file),
+                root: root.to_string(),
+            },
+            language: String::new(),
+            signature: format!("file {}", file),
+            line_start: 0,
+            line_end: 0,
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::Git,
+        }
+    }
+
+    fn make_function(root: &str, file: &str, name: &str, cyclomatic: u32) -> Node {
+        let mut node = make_node(name, NodeKind::Function, file);
+        node.id.root = root.to_string();
+        node.metadata
+            .insert("cyclomatic".to_string(), cyclomatic.to_string());
+        node
+    }
+
+    /// Ranking multiplies churn by aggregate complexity, so a file with lower
+    /// churn but much higher complexity can outrank a high-churn, low-complexity
+    /// file (#889 -- this is the whole point of the redefinition).
+    #[test]
+    fn test_hotspot_ranking_multiplies_churn_and_complexity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        git2::Repository::init(&repo_root).unwrap();
+        let root = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
+
+        // file_a: churn 5 x complexity 10 = 50
+        // file_b: churn 1 x complexity 100 = 100 -- should rank first.
+        let mut nodes = vec![
+            make_function(&root, "src/a.rs", "a_fn", 10),
+            make_function(&root, "src/b.rs", "b_fn", 100),
+            make_file_anchor(&root, "src/a.rs", 5),
+            make_file_anchor(&root, "src/b.rs", 1),
+        ];
+        nodes.iter_mut().for_each(|n| {
+            n.metadata.insert("importance".into(), "0.01".into());
+        });
+        let gs = make_graph_state(nodes);
+        let business_context = BusinessContextAdmission::default();
+        let ctx = RepoMapContext {
+            graph_state: &gs,
+            repo_root: &repo_root,
+            lsp_status: None,
+            embed_status: None,
+            business_context: &business_context,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: Some(root.clone()),
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        let hotspot_section = result
+            .split("## Hotspot files")
+            .nth(1)
+            .expect("hotspot section present");
+        let b_pos = hotspot_section.find("src/b.rs").expect("b.rs present");
+        let a_pos = hotspot_section.find("src/a.rs").expect("a.rs present");
+        assert!(
+            b_pos < a_pos,
+            "higher-scoring file (b.rs, score 100) should rank above a.rs (score 50): {result}"
+        );
+        assert!(
+            hotspot_section.contains("churn 1 x complexity 100 = 100"),
+            "expected auditable score components for b.rs: {result}"
+        );
+        assert!(
+            hotspot_section.contains("churn 5 x complexity 10 = 50"),
+            "expected auditable score components for a.rs: {result}"
+        );
+    }
+
+    /// Files with zero churn (git available, file just never changed in the
+    /// mined window) still appear, ranked at the bottom, with an explicit "0".
+    #[test]
+    fn test_hotspot_ranking_zero_churn_is_explicit_not_hidden() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        git2::Repository::init(&repo_root).unwrap();
+        let root = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
+
+        // No file anchor node for src/never_changed.rs -- churn_by_file has no
+        // entry for it despite git being available, so it must render "0".
+        let mut nodes = vec![make_function(&root, "src/never_changed.rs", "f", 42)];
+        nodes[0].metadata.insert("importance".into(), "0.01".into());
+        let gs = make_graph_state(nodes);
+        let business_context = BusinessContextAdmission::default();
+        let ctx = RepoMapContext {
+            graph_state: &gs,
+            repo_root: &repo_root,
+            lsp_status: None,
+            embed_status: None,
+            business_context: &business_context,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: Some(root),
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        assert!(
+            result.contains("churn 0 x complexity 42 = 0"),
+            "zero churn must be stated explicitly, not omitted: {result}"
+        );
+    }
+
+    /// Files with zero aggregate complexity (e.g. a file of plain structs) still
+    /// appear, with complexity stated as 0 rather than the file being dropped.
+    #[test]
+    fn test_hotspot_ranking_zero_complexity_is_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        git2::Repository::init(&repo_root).unwrap();
+        let root = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
+
+        // A struct node has no "cyclomatic" metadata key.
+        let mut nodes = vec![
+            make_node("Plain", NodeKind::Struct, "src/plain.rs"),
+            make_file_anchor(&root, "src/plain.rs", 9),
+        ];
+        nodes[0].id.root = root.clone();
+        nodes[0].metadata.insert("importance".into(), "0.01".into());
+        let gs = make_graph_state(nodes);
+        let business_context = BusinessContextAdmission::default();
+        let ctx = RepoMapContext {
+            graph_state: &gs,
+            repo_root: &repo_root,
+            lsp_status: None,
+            embed_status: None,
+            business_context: &business_context,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: Some(root),
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        assert!(
+            result.contains("churn 9 x complexity 0 = 0"),
+            "zero complexity must be stated explicitly: {result}"
+        );
+    }
+
+    /// Ties (equal churn x complexity score) break deterministically rather
+    /// than depending on HashMap iteration order.
+    #[test]
+    fn test_hotspot_ranking_ties_break_deterministically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        git2::Repository::init(&repo_root).unwrap();
+        let root = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
+
+        let mut nodes = vec![
+            make_function(&root, "src/z.rs", "z_fn", 10),
+            make_function(&root, "src/y.rs", "y_fn", 10),
+            make_file_anchor(&root, "src/z.rs", 2),
+            make_file_anchor(&root, "src/y.rs", 2),
+        ];
+        nodes.iter_mut().for_each(|n| {
+            n.metadata.insert("importance".into(), "0.01".into());
+        });
+        let gs1 = make_graph_state(nodes.clone());
+        let gs2 = make_graph_state({
+            nodes.reverse();
+            nodes
+        });
+        let business_context = BusinessContextAdmission::default();
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: Some(root.clone()),
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result1 = repo_map(
+            &params,
+            &RepoMapContext {
+                graph_state: &gs1,
+                repo_root: &repo_root,
+                lsp_status: None,
+                embed_status: None,
+                business_context: &business_context,
+            },
+        );
+        let result2 = repo_map(
+            &params,
+            &RepoMapContext {
+                graph_state: &gs2,
+                repo_root: &repo_root,
+                lsp_status: None,
+                embed_status: None,
+                business_context: &business_context,
+            },
+        );
+        let hotspots1 = result1.split("## Hotspot files").nth(1).unwrap();
+        let hotspots2 = result2.split("## Hotspot files").nth(1).unwrap();
+        assert_eq!(
+            hotspots1, hotspots2,
+            "tied scores must sort deterministically regardless of input order"
+        );
+        // y.rs sorts before z.rs alphabetically -- the tiebreak key.
+        let y_pos = hotspots1.find("src/y.rs").unwrap();
+        let z_pos = hotspots1.find("src/z.rs").unwrap();
+        assert!(y_pos < z_pos, "alphabetical tiebreak: {hotspots1}");
+    }
+
+    /// A file on a root that co-change mining never ran against (not the
+    /// primary/mined root) reports churn as unavailable with a stated reason,
+    /// never a silent zero.
+    #[test]
+    fn test_hotspot_ranking_non_mined_root_states_churn_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        git2::Repository::init(&repo_root).unwrap();
+
+        // "other-root" is not `RootConfig::code_project(repo_root).slug()`.
+        let mut node = make_function("other-root", "src/secondary.rs", "f", 7);
+        node.metadata.insert("importance".into(), "0.01".into());
+        let gs = make_graph_state(vec![node]);
+        let business_context = BusinessContextAdmission::default();
+        let ctx = RepoMapContext {
+            graph_state: &gs,
+            repo_root: &repo_root,
+            lsp_status: None,
+            embed_status: None,
+            business_context: &business_context,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: None,
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        assert!(
+            result.contains(
+                "churn: not available (root not mined for co-change/churn); complexity 7"
+            ),
+            "non-mined root must state why churn is unavailable, not imply 0: {result}"
+        );
+    }
+
+    /// A non-git repo root degrades explicitly ("no .git"), never a silent zero.
+    #[test]
+    fn test_hotspot_ranking_non_git_root_states_churn_unavailable() {
+        let repo_root = PathBuf::from("/tmp/definitely-not-a-git-repo-889");
+        let root = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
+        let mut node = make_function(&root, "src/f.rs", "f", 3);
+        node.metadata.insert("importance".into(), "0.01".into());
+        let gs = make_graph_state(vec![node]);
+        let business_context = BusinessContextAdmission::default();
+        let ctx = RepoMapContext {
+            graph_state: &gs,
+            repo_root: &repo_root,
+            lsp_status: None,
+            embed_status: None,
+            business_context: &business_context,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: Some(root),
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        assert!(
+            result.contains("churn: not available (no .git); complexity 3"),
+            "non-git root must state why churn is unavailable, not imply 0: {result}"
+        );
     }
 }

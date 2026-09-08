@@ -403,7 +403,7 @@ fn list_roots_from_slugs_with_report_recovery(
             // report a nested subdirectory as minable when mining will fail
             // (#884 review).
             if git2::Repository::open(&r.path).is_err() {
-                line.push_str("\n  Co-change: not available (no .git)");
+                line.push_str("\n  Co-change: not available (no .git); churn: not available (no .git)");
             }
 
             line

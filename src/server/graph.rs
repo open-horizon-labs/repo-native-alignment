@@ -1867,7 +1867,7 @@ impl RnaHandler {
                 None,
                 &existing_stable_ids,
             ) {
-                Ok((file_nodes, cochange_edges, stats, head_sha)) => {
+                Ok((file_nodes, cochange_edges, stats, head_sha, _file_changes)) => {
                     tracing::info!(
                         "Co-change mining: {} file anchor nodes, {} CoChanges edges (window: {} commits, {} days)",
                         file_nodes.len(),
@@ -3015,7 +3015,7 @@ impl RnaHandler {
                     None,
                     &existing_stable_ids,
                 ) {
-                    Ok((file_nodes, cochange_edges, stats, head_sha)) => {
+                    Ok((file_nodes, cochange_edges, stats, head_sha, _file_changes)) => {
                         tracing::info!(
                             "Co-change re-mining (incremental): {} file anchor nodes, {} CoChanges edges",
                             file_nodes.len(),
