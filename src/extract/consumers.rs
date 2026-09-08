@@ -856,6 +856,16 @@ impl EnrichmentFinalizer {
             }
         }
 
+        // Step 10b: local-knowledge symbol binding (#897) -- resolve `rna:` frontmatter
+        // relationships that target a code symbol against the real graph node, now that
+        // the full node set (all roots' code + markdown) is visible. Must run after step
+        // 10 emits/merges edges (it rewrites edges already in `all_edges` in place, it
+        // does not add new ones) and after any pass that could add code symbol nodes.
+        crate::extract::markdown::local_knowledge_symbol_binding_pass(
+            &mut all_nodes,
+            &mut all_edges,
+        );
+
         // Step 11: import_calls — resolves bare function calls via import nodes.
         {
             let new_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);

@@ -8,6 +8,10 @@ use crate::graph::index::GraphIndex;
 use petgraph::Direction;
 use rust_mcp_sdk::schema::{CallToolError, CallToolResult, TextContent};
 
+/// Maximum number of artifact notes shown on a single code row's detailed
+/// `Notes:` block before collapsing the rest into `+M more`.
+const MAX_NOTES_SHOWN: usize = 3;
+
 /// Minimum importance score to display in tool output.
 /// Scores at or below this threshold are suppressed as noise.
 pub(crate) const IMPORTANCE_THRESHOLD: f64 = 0.001;
@@ -279,7 +283,188 @@ fn format_fenced_code_block(content: &str, lang_hint: &str) -> String {
 }
 
 pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> String {
-    format_node_entry_with_root(n, index, compact, None, false, false)
+    format_node_entry_with_root(n, index, compact, None, false, false, &[])
+}
+
+/// Whether `node` is a legitimate source for a rendered artifact note (#897).
+///
+/// Only human-authored `.oh/` artifacts count: `.oh/{metis,guardrails,signals,
+/// outcomes}` Markdown sections, or `rna:` frontmatter local-knowledge nodes
+/// (`emit_local_knowledge_graph`, tagged `metadata["local_knowledge"] ==
+/// "true"`). Synthetic nodes -- LSP diagnostics, co-change file anchors,
+/// framework/topology nodes -- are also `NodeKind::Other(_)` but are never
+/// tagged `local_knowledge`, so they never qualify.
+pub(crate) fn is_notes_source(node: &graph::Node) -> bool {
+    if node.metadata.get("local_knowledge").map(String::as_str) == Some("true") {
+        return true;
+    }
+    if node.id.kind == graph::NodeKind::MarkdownSection {
+        return matches!(
+            node.metadata.get("oh_kind").map(String::as_str),
+            Some("metis") | Some("guardrail") | Some("signal") | Some("outcome")
+        );
+    }
+    false
+}
+
+/// Collect the artifact notes bound to `stable_id` for rendering.
+///
+/// Joins on `GraphIndex` incoming `References` edges and `GraphState`'s
+/// already-cached `stable_id -> index` map -- no per-row file I/O, no new
+/// allocation beyond the returned `Vec` (issue #897's cost requirement).
+/// `lookup` is typically `|id| graph_state.node_by_stable_id(id, index_map)`,
+/// reusing the lazily-built cache rather than allocating a fresh
+/// `stable_id -> &Node` map per request.
+pub(crate) fn collect_artifact_notes<'a>(
+    stable_id: &str,
+    index: &GraphIndex,
+    lookup: impl Fn(&str) -> Option<&'a graph::Node>,
+) -> Vec<&'a graph::Node> {
+    index
+        .neighbors(
+            stable_id,
+            Some(&[graph::EdgeKind::References]),
+            Direction::Incoming,
+        )
+        .into_iter()
+        .filter_map(|id| lookup(&id))
+        .filter(|node| is_notes_source(node))
+        .collect()
+}
+
+/// Artifact kind + human identifier for a note source, e.g. `("guardrail",
+/// "no-parallel-cargo-agents")`. Prefers the `rna:` declared kind/id for
+/// local-knowledge nodes, falling back to the `.oh_kind` + frontmatter `id`/
+/// `title` (or file stem) for plain `.oh/` Markdown sections.
+fn note_identity(node: &graph::Node) -> (String, String) {
+    if let Some(kind) = node.metadata.get("rna.kind") {
+        let id = node
+            .metadata
+            .get("rna.id")
+            .cloned()
+            .unwrap_or_else(|| node.id.name.clone());
+        return (kind.clone(), id);
+    }
+    let kind = node
+        .metadata
+        .get("oh_kind")
+        .cloned()
+        .unwrap_or_else(|| node.id.kind.to_string());
+    let id = node
+        .metadata
+        .get("frontmatter.id")
+        .or_else(|| node.metadata.get("frontmatter.title"))
+        .cloned()
+        .unwrap_or_else(|| {
+            node.id
+                .file
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| node.id.name.clone())
+        });
+    (kind, id)
+}
+
+/// First sentence of `body` (already frontmatter-stripped for local-knowledge
+/// nodes), truncated to `max_chars`. Verbatim artifact text -- nothing
+/// synthesized, per the `metis-curation-requires-human-judgment` guardrail.
+///
+/// Skips leading Markdown heading lines (`#`, `##`, ...) to reach the first
+/// paragraph of prose, and does not treat a numbered-list marker (`1.`, `2.`)
+/// as a sentence end -- `## Rule\n\n1. Do the thing.` should excerpt "Do the
+/// thing.", not stop dead at "1.".
+fn first_sentence(body: &str, max_chars: usize) -> String {
+    let mut text = body.trim();
+    while text.starts_with('#') {
+        text = match text.find('\n') {
+            Some(nl) => text[nl + 1..].trim_start(),
+            None => "",
+        };
+    }
+    let trimmed = text;
+
+    let mut end = trimmed.len();
+    for (i, c) in trimmed.char_indices() {
+        if !matches!(c, '.' | '!' | '?') {
+            continue;
+        }
+        // Allow closing Markdown emphasis/code markers (`**text.**`,
+        // `` `text.` ``) between the punctuation and the sentence boundary.
+        let mut after = i + c.len_utf8();
+        while trimmed[after..].starts_with(['*', '_', '`']) {
+            after += 1;
+        }
+        let next = trimmed[after..].chars().next();
+        if !(next.is_none() || next.is_some_and(char::is_whitespace)) {
+            continue;
+        }
+        // A bare number immediately before the punctuation is a list marker
+        // (`1.`, `12.`), not a sentence end.
+        let token_start = trimmed[..i]
+            .rfind(|ch: char| ch.is_whitespace())
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if !trimmed[token_start..i].is_empty()
+            && trimmed[token_start..i]
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+        {
+            continue;
+        }
+        end = after;
+        break;
+    }
+    let sentence = trimmed[..end].trim();
+    let char_count = sentence.chars().count();
+    if char_count <= max_chars {
+        return sentence.to_string();
+    }
+    let truncated: String = sentence.chars().take(max_chars).collect();
+    format!("{}…", truncated.trim_end())
+}
+
+/// Excerpt source text for a note: prefer a guardrail's one-line `statement`
+/// or a metis/signal/outcome's `title` (both verbatim frontmatter fields --
+/// exactly the human-written one-liner these artifacts already carry) over
+/// the raw body, which may be list-heavy and not itself sentence-shaped.
+/// Falls through to the body when neither is present.
+fn note_excerpt(node: &graph::Node, max_chars: usize) -> String {
+    if let Some(statement) = node.metadata.get("frontmatter.statement") {
+        return first_sentence(statement, max_chars);
+    }
+    if let Some(title) = node.metadata.get("frontmatter.title") {
+        return first_sentence(title, max_chars);
+    }
+    first_sentence(&node.body, max_chars)
+}
+
+/// Render the bounded `Notes:` marker/block described in issue #897: a compact
+/// count marker (` notes:N`) or a detailed block listing artifact kind,
+/// id/title, source path, and a one-line excerpt, capped at
+/// `MAX_NOTES_SHOWN` with `+M more`.
+fn append_notes(entry: &mut String, notes: &[&graph::Node], compact: bool) {
+    if notes.is_empty() {
+        return;
+    }
+    if compact {
+        entry.push_str(&format!(" notes:{}", notes.len()));
+        return;
+    }
+    entry.push_str("\n  Notes:");
+    for note in notes.iter().take(MAX_NOTES_SHOWN) {
+        let (kind, id) = note_identity(note);
+        let excerpt = note_excerpt(note, 160);
+        entry.push_str(&format!(
+            "\n    - [{}] {} ({}): {}",
+            kind,
+            id,
+            note.id.file.display(),
+            excerpt
+        ));
+    }
+    if notes.len() > MAX_NOTES_SHOWN {
+        entry.push_str(&format!("\n    - +{} more", notes.len() - MAX_NOTES_SHOWN));
+    }
 }
 
 /// Format a single node, optionally stripping the root slug prefix from
@@ -327,6 +512,7 @@ pub(crate) fn format_node_entry_with_root(
     strip_root: Option<&str>,
     include_body: bool,
     minify_body: bool,
+    notes: &[&graph::Node],
 ) -> String {
     let stable_id = n.stable_id();
     let display_id = strip_root_prefix(&stable_id, strip_root);
@@ -415,6 +601,7 @@ pub(crate) fn format_node_entry_with_root(
             entry.push_str(&format!(" imp:{:.3}", score));
         }
         append_local_knowledge_metadata(&mut entry, n, true);
+        append_notes(&mut entry, notes, true);
         let edge_count = index.neighbors(&stable_id, None, Direction::Outgoing).len()
             + index.neighbors(&stable_id, None, Direction::Incoming).len();
         if edge_count > 0 {
@@ -551,6 +738,7 @@ pub(crate) fn format_node_entry_with_root(
             entry.push_str(&format!("\n  HTTP Path: {}", path));
         }
         append_local_knowledge_metadata(&mut entry, n, false);
+        append_notes(&mut entry, notes, false);
         if !outgoing.is_empty() {
             entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
         }
@@ -663,6 +851,7 @@ pub(crate) fn format_neighbors_grouped_with_root(
                         strip_root,
                         include_body,
                         minify_body,
+                        &[],
                     )
                 } else {
                     format_unresolved_id(id, strip_root)
@@ -886,7 +1075,7 @@ pub(crate) fn format_neighbor_nodes(
 mod tests {
     use super::*;
     use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn test_format_freshness_without_lsp_status() {
@@ -1383,7 +1572,8 @@ mod tests {
     fn test_format_node_entry_with_root_strips_prefix() {
         let node = make_test_node("my_func");
         let index = GraphIndex::new();
-        let full = format_node_entry_with_root(&node, &index, false, Some("test"), false, false);
+        let full =
+            format_node_entry_with_root(&node, &index, false, Some("test"), false, false, &[]);
         // The stable ID should NOT start with "test:" in the display
         assert!(
             full.contains("ID: `src/test.rs:my_func:function`"),
@@ -1406,8 +1596,10 @@ mod tests {
         );
         let index = GraphIndex::new();
 
-        let compact = format_node_entry_with_root(&node, &index, true, Some("test"), false, false);
-        let full = format_node_entry_with_root(&node, &index, false, Some("test"), false, false);
+        let compact =
+            format_node_entry_with_root(&node, &index, true, Some("test"), false, false, &[]);
+        let full =
+            format_node_entry_with_root(&node, &index, false, Some("test"), false, false, &[]);
 
         assert!(compact.contains("src:markdown"), "got: {compact}");
         assert!(full.contains("Extraction source: markdown"), "got: {full}");
@@ -1423,11 +1615,213 @@ mod tests {
         }
     }
 
+    // ── artifact notes tests (#897) ─────────────────────────────────
+
+    fn make_local_knowledge_note(kind: &str, id: &str, body: &str) -> Node {
+        let mut node = make_test_node(&format!("{kind}.{id}"));
+        node.id.kind = NodeKind::Other(kind.to_string());
+        node.id.file = std::path::PathBuf::from(format!(".oh/{kind}s/{id}.md"));
+        node.source = ExtractionSource::Markdown;
+        node.body = body.to_string();
+        node.metadata
+            .insert("local_knowledge".to_string(), "true".to_string());
+        node.metadata
+            .insert("rna.kind".to_string(), kind.to_string());
+        node.metadata.insert("rna.id".to_string(), id.to_string());
+        node
+    }
+
+    fn make_synthetic_node(kind: &str) -> Node {
+        let mut node = make_test_node("synthetic");
+        node.id.kind = NodeKind::Other(kind.to_string());
+        node
+    }
+
+    #[test]
+    fn test_is_notes_source_accepts_local_knowledge_and_oh_markdown_rejects_synthetic() {
+        let guardrail_note = make_local_knowledge_note(
+            "guardrail",
+            "no-parallel-cargo-agents",
+            "Never run two cargo builds against the same target directory.",
+        );
+        assert!(is_notes_source(&guardrail_note));
+
+        let mut oh_section = make_test_node("Problem");
+        oh_section.id.kind = NodeKind::MarkdownSection;
+        oh_section
+            .metadata
+            .insert("oh_kind".to_string(), "metis".to_string());
+        assert!(is_notes_source(&oh_section));
+
+        let mut non_oh_section = make_test_node("Overview");
+        non_oh_section.id.kind = NodeKind::MarkdownSection;
+        non_oh_section
+            .metadata
+            .insert("oh_kind".to_string(), "cursor-rule".to_string());
+        assert!(
+            !is_notes_source(&non_oh_section),
+            "only metis/guardrail/signal/outcome sections qualify, not other oh_kinds"
+        );
+
+        for synthetic_kind in ["lsp_document_symbol", "file", "framework"] {
+            let synthetic = make_synthetic_node(synthetic_kind);
+            assert!(
+                !is_notes_source(&synthetic),
+                "synthetic node kind `{synthetic_kind}` must never be a notes source"
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_artifact_notes_joins_incoming_references_and_excludes_synthetic() {
+        let code = make_test_node("commit_state");
+        let code_id = code.stable_id();
+        let guardrail = make_local_knowledge_note(
+            "guardrail",
+            "no-parallel-cargo-agents",
+            "Never run two cargo builds against the same target directory.",
+        );
+        let cochange_anchor = make_synthetic_node("file");
+
+        let mut index = GraphIndex::new();
+        index.add_edge(
+            &guardrail.stable_id(),
+            "guardrail",
+            &code_id,
+            "function",
+            graph::EdgeKind::References,
+        );
+        index.add_edge(
+            &cochange_anchor.stable_id(),
+            "file",
+            &code_id,
+            "function",
+            graph::EdgeKind::References,
+        );
+
+        let lookup_nodes = [guardrail.clone(), cochange_anchor.clone()];
+        let by_id: HashMap<String, &Node> =
+            lookup_nodes.iter().map(|n| (n.stable_id(), n)).collect();
+
+        let notes = collect_artifact_notes(&code_id, &index, |id| by_id.get(id).copied());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id.name, guardrail.id.name);
+    }
+
+    #[test]
+    fn test_format_node_entry_with_root_notes_compact_marker() {
+        let node = make_test_node("commit_state");
+        let index = GraphIndex::new();
+
+        let no_notes = format_node_entry_with_root(&node, &index, true, None, false, false, &[]);
+        assert!(!no_notes.contains("notes:"), "got: {no_notes}");
+
+        let one = make_local_knowledge_note("guardrail", "g1", "First note.");
+        let with_one =
+            format_node_entry_with_root(&node, &index, true, None, false, false, &[&one]);
+        assert!(with_one.contains(" notes:1"), "got: {with_one}");
+
+        let two = make_local_knowledge_note("metis", "m1", "Second note.");
+        let three = make_local_knowledge_note("signal", "s1", "Third note.");
+        let four = make_local_knowledge_note("outcome", "o1", "Fourth note.");
+        let many = [&one, &two, &three, &four];
+        let with_many = format_node_entry_with_root(&node, &index, true, None, false, false, &many);
+        assert!(with_many.contains(" notes:4"), "got: {with_many}");
+    }
+
+    #[test]
+    fn test_format_node_entry_with_root_notes_detailed_block_bounds_at_max_shown() {
+        let node = make_test_node("commit_state");
+        let index = GraphIndex::new();
+
+        let no_notes = format_node_entry_with_root(&node, &index, false, None, false, false, &[]);
+        assert!(!no_notes.contains("Notes:"), "got: {no_notes}");
+
+        let one = make_local_knowledge_note(
+            "guardrail",
+            "no-parallel-cargo-agents",
+            "Never run two cargo builds against the same target directory. Extra detail after the first sentence.",
+        );
+        let with_one =
+            format_node_entry_with_root(&node, &index, false, None, false, false, &[&one]);
+        assert!(with_one.contains("Notes:"), "got: {with_one}");
+        assert!(
+            with_one.contains(
+                "[guardrail] no-parallel-cargo-agents (.oh/guardrails/no-parallel-cargo-agents.md): Never run two cargo builds against the same target directory."
+            ),
+            "got: {with_one}"
+        );
+        assert!(
+            !with_one.contains("Extra detail"),
+            "excerpt must stop at the first sentence, got: {with_one}"
+        );
+
+        let two = make_local_knowledge_note("metis", "m1", "Second note.");
+        let three = make_local_knowledge_note("signal", "s1", "Third note.");
+        let four = make_local_knowledge_note("outcome", "o1", "Fourth note.");
+        let many = [&one, &two, &three, &four];
+        let with_many =
+            format_node_entry_with_root(&node, &index, false, None, false, false, &many);
+        assert_eq!(
+            with_many.matches("\n    - [").count(),
+            3,
+            "at most MAX_NOTES_SHOWN bullet lines, got: {with_many}"
+        );
+        assert!(with_many.contains("+1 more"), "got: {with_many}");
+    }
+
+    #[test]
+    fn test_first_sentence_skips_heading_and_does_not_stop_at_list_marker() {
+        let body = "## Rule\n\n1. **One cargo build per target directory.** Before running `cargo build`, sanity-check.";
+        let excerpt = first_sentence(body, 200);
+        assert_eq!(
+            excerpt, "1. **One cargo build per target directory.**",
+            "must skip the heading line and not stop at the `1.` list marker"
+        );
+    }
+
+    #[test]
+    fn test_note_excerpt_prefers_frontmatter_statement_over_body() {
+        let mut node = make_local_knowledge_note(
+            "guardrail",
+            "computed-but-not-delivered",
+            "## The Pattern\n\nWhen adding new metadata:\n1. Add extraction\n2. Add schema",
+        );
+        node.metadata.insert(
+            "frontmatter.statement".to_string(),
+            "New metadata must wire through 3 layers. Computing a value is not delivering it."
+                .to_string(),
+        );
+        assert_eq!(
+            note_excerpt(&node, 200),
+            "New metadata must wire through 3 layers."
+        );
+    }
+
+    #[test]
+    fn test_note_excerpt_falls_back_to_title_then_body() {
+        let mut with_title =
+            make_local_knowledge_note("metis", "m1", "Body text that would otherwise be used.");
+        with_title.metadata.insert(
+            "frontmatter.title".to_string(),
+            "A learned title.".to_string(),
+        );
+        assert_eq!(note_excerpt(&with_title, 200), "A learned title.");
+
+        let no_frontmatter_fields =
+            make_local_knowledge_note("metis", "m2", "Only the body is available here.");
+        assert_eq!(
+            note_excerpt(&no_frontmatter_fields, 200),
+            "Only the body is available here."
+        );
+    }
+
     #[test]
     fn test_format_node_entry_with_root_compact_strips_prefix() {
         let node = make_test_node("my_func");
         let index = GraphIndex::new();
-        let compact = format_node_entry_with_root(&node, &index, true, Some("test"), false, false);
+        let compact =
+            format_node_entry_with_root(&node, &index, true, Some("test"), false, false, &[]);
         // The trailing stable ID line should not have the root prefix
         assert!(
             compact.contains("`src/test.rs:my_func:function`"),
@@ -1447,7 +1841,8 @@ mod tests {
         node.language = "typescript".to_string();
         node.body = "const fenced = \"```\";\nconst inline = `value`;".to_string();
         let index = GraphIndex::new();
-        let full = format_node_entry_with_root(&node, &index, false, Some("test"), true, false);
+        let full =
+            format_node_entry_with_root(&node, &index, false, Some("test"), true, false, &[]);
 
         assert!(full.contains("````typescript"));
         assert!(full.contains("const fenced = \"```\";"));
@@ -1460,8 +1855,8 @@ mod tests {
         node.language = "typescript".to_string();
         node.body = "const longName = 1;".to_string();
         let index = GraphIndex::new();
-        let compact = format_node_entry_with_root(&node, &index, true, None, true, true);
-        let full = format_node_entry_with_root(&node, &index, false, None, true, true);
+        let compact = format_node_entry_with_root(&node, &index, true, None, true, true, &[]);
+        let full = format_node_entry_with_root(&node, &index, false, None, true, true, &[]);
         let marker = "body_minification.v1 provenance=structural_ast wrapper=false";
         assert!(compact.contains(marker), "got: {compact}");
         assert!(full.contains(marker), "got: {full}");
@@ -1474,7 +1869,8 @@ mod tests {
         node.body = "const broken = \"unterminated-sensitive-value".to_string();
         let index = GraphIndex::new();
         for compact in [true, false] {
-            let rendered = format_node_entry_with_root(&node, &index, compact, None, true, true);
+            let rendered =
+                format_node_entry_with_root(&node, &index, compact, None, true, true, &[]);
             assert!(rendered.contains(
                 "body_minification.v1 failure language=typescript stage=wrapper_parse reason=syntax_error"
             ));
@@ -1491,7 +1887,8 @@ mod tests {
         let node = make_test_node("empty_fn");
         let index = GraphIndex::new();
         for compact in [true, false] {
-            let rendered = format_node_entry_with_root(&node, &index, compact, None, true, true);
+            let rendered =
+                format_node_entry_with_root(&node, &index, compact, None, true, true, &[]);
             assert!(rendered.contains(
                 "body_minification.v1 failure language=rust stage=input_validation reason=empty_body"
             ));

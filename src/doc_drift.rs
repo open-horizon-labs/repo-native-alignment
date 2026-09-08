@@ -339,7 +339,11 @@ fn looks_like_symbol(span: &str) -> bool {
 
 /// Reduce a symbol reference like `Config::new()` or `NodeKind::MarkdownSection`
 /// to the leaf identifier used for exact-name graph lookup.
-fn leaf_identifier(span: &str) -> &str {
+///
+/// `pub(crate)` so other resolvers facing the same owner-qualified-name problem
+/// (e.g. `extract::markdown::local_knowledge_symbol_binding_pass`, #897) reuse
+/// this instead of re-implementing it.
+pub(crate) fn leaf_identifier(span: &str) -> &str {
     let trimmed = span.trim_end_matches("()");
     let after_path = trimmed.rsplit("::").next().unwrap_or(trimmed);
     // `receiver.method()` names the method, not the receiver variable.
@@ -429,7 +433,10 @@ fn is_symbol_bindable_file(path: &Path) -> bool {
 
 /// Node kinds whose presence proves a file is indexed as code and whose names
 /// are the universe a backticked symbol can be checked against.
-fn is_code_symbol_kind(kind: &NodeKind) -> bool {
+///
+/// `pub(crate)` so `extract::markdown::local_knowledge_symbol_binding_pass`
+/// (#897) shares the same code-symbol universe rather than redefining it.
+pub(crate) fn is_code_symbol_kind(kind: &NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::Function

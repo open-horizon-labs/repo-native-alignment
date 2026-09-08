@@ -78,6 +78,51 @@ check "subsystem filter" \
 check "cross-file calls symbol present" \
   "repo-native-alignment search 'import_calls_pass' --repo $RNA_REPO --limit 1" "import_calls"
 
+# ── ARTIFACT NOTES ON BOUND CODE SYMBOLS (#897) ───────────────────────────
+# Real end-to-end proof against this repo's own `.oh/`: the
+# computed-but-not-delivered guardrail carries an `rna` block binding it to
+# format_node_entry_with_root (the exact rendering function it's about). If
+# binding, resolution, and rendering are all wired up, `search --nodes` shows
+# a `Notes:` block on that symbol, and `repo_map` shows the compact marker if
+# it's in the top-symbols list.
+#
+# local_knowledge_symbol_binding_pass resolves cross-file (artifact -> code
+# symbol in a different file), same as ADR validation. That resolution only
+# sees nodes present in a single EnrichmentFinalizer::run_passes invocation;
+# an incremental scan that reprocesses the artifact and the symbol's file as
+# separate partitions (unrelated to any #897 change) can leave the edge
+# unresolved even though both sides are individually up to date. Force a
+# clean scan here -- and run it before the suite's later full (non
+# --extract-only) `scan` calls, which spawn background LSP/embedding
+# enrichment that can race a later re-scan and re-persist a stale graph --
+# matching the issue's "clean-scan with the release binary" instruction.
+rm -rf "$RNA_REPO/.oh/.cache"
+if ! _notes_scan_out=$(repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp 2>&1); then
+  echo "FAIL: clean scan for artifact-notes check failed"
+  echo "$_notes_scan_out" | tail -20
+  FAIL=$((FAIL+1))
+fi
+echo "" && echo "--- Artifact notes on bound code symbols (#897) ---"
+check "notes: Notes: block present on detailed search --nodes output (#897)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/server/helpers.rs:format_node_entry_with_root:function' --limit 1 2>/dev/null" "Notes:"
+check "notes: bound guardrail surfaces in detailed search --nodes output (#897)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/server/helpers.rs:format_node_entry_with_root:function' --limit 1 2>/dev/null" "\[guardrail\] computed-but-not-delivered"
+check "notes: compact marker present for the same symbol (#897)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/server/helpers.rs:format_node_entry_with_root:function' --compact --limit 1 2>/dev/null" "notes:1"
+# Regression: editing the bound file must not drop its notes on the next
+# incremental scan (the artifact is re-extracted and re-bound, #897).
+if git -C "$RNA_REPO" diff --quiet -- src/server/helpers.rs 2>/dev/null; then
+  printf '\n// notes-incremental-probe\n' >> "$RNA_REPO/src/server/helpers.rs"
+  repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+  git -C "$RNA_REPO" checkout -q -- src/server/helpers.rs
+  check "notes: survive an incremental scan after the bound file changes (#897)" \
+    "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/server/helpers.rs:format_node_entry_with_root:function' --limit 1 2>/dev/null" "Notes:"
+  repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+else
+  echo "SKIP: notes incremental regression (src/server/helpers.rs has local modifications)"
+  SKIP=$((SKIP+1))
+fi
+
 # ── CO-CHANGE MINING (#884) ──────────────────────────────────────────────────
 echo "" && echo "--- Co-change mining (#884) ---"
 # src/server/tools.rs and src/server/handlers.rs have historically changed
