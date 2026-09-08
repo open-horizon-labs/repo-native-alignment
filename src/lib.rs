@@ -6,6 +6,7 @@ pub mod bus;
 pub mod business_context;
 pub mod code;
 pub mod consumers;
+pub mod doc_drift;
 pub mod embed;
 pub mod extract;
 pub mod git;

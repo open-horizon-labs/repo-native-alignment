@@ -860,6 +860,36 @@ check "no swebench workflows remain (#871/#872)" \
 check "CI has local-runner routing switch (#867/#868)" \
   "grep -c 'LOCAL_LINUX_CI_ENABLED' $RNA_REPO/.github/workflows/rust-main-merge.yml" "[1-9]"
 
+# #891: documentation-drift verifier -- on-demand `search(mode="doc_drift")`.
+# Plant a known-dead file:line reference, a dead bound symbol, and a dead bare
+# path in a throwaway fixture repo, and confirm the checker actually catches
+# them (silently returning zero findings would be indistinguishable from a
+# broken checker without this).
+_DRIFT_FIX=$(mktemp -d "${TMPDIR:-/tmp}/rna-doc-drift.XXXXXX")
+mkdir -p "$_DRIFT_FIX/src" "$_DRIFT_FIX/.oh/metis"
+printf 'pub struct Keeper;\n' > "$_DRIFT_FIX/src/keep.rs"
+cat > "$_DRIFT_FIX/.oh/metis/drift-fixture.md" <<'EOF'
+# Drift fixture
+
+See `src/keep.rs:99` for the (nonexistent) line.
+
+The old `src/gone.rs` module used to live here.
+
+In `src/keep.rs`, the `Removed` type used to control this.
+EOF
+repo-native-alignment scan --repo "$_DRIFT_FIX" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+check "doc_drift: dead file:line reference caught (#891)" \
+  "repo-native-alignment search '' --repo $_DRIFT_FIX --mode doc_drift --limit 50 2>/dev/null" "src/keep.rs:99.*exceeds file length"
+check "doc_drift: dead bare-path reference caught (#891)" \
+  "repo-native-alignment search '' --repo $_DRIFT_FIX --mode doc_drift --limit 50 2>/dev/null" "src/gone.rs.*does not exist"
+check "doc_drift: dead bound symbol reference caught (#891)" \
+  "repo-native-alignment search '' --repo $_DRIFT_FIX --mode doc_drift --limit 50 2>/dev/null" "Removed.*not found in src/keep.rs"
+rm -rf "$_DRIFT_FIX"
+
+# Real end-to-end run against this repository's own .oh/, docs/, and README.
+check "doc_drift: runs against the RNA repo's own .oh/docs/README (#891)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --mode doc_drift --limit 200 2>/dev/null" "Documentation drift"
+
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
 if [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
