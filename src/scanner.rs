@@ -721,6 +721,18 @@ pub struct Scanner {
     /// "this is just the value that happened to be on disk when we started",
     /// since co-change mining advances the same field mid-scan (#884 review).
     loaded_cochange_watermark_sha: Option<String>,
+    /// Classification updates this Scanner recorded via
+    /// `apply_file_classifications` (#901). `file_classifications` is owned by
+    /// extraction and has two writers (the CLI's scanner and the rebuild-owned
+    /// scanner inside `build_full_graph_inner`); `commit_state` starts from the
+    /// persisted map and applies only these deltas, so a scanner that merely
+    /// loaded stale state never clobbers a census another writer just wrote.
+    class_updates: HashMap<PathBuf, FileClassification>,
+    /// Classification removals recorded via `remove_file_classifications`.
+    class_removals: std::collections::HashSet<PathBuf>,
+    /// Set by `set_file_classifications`: this Scanner holds a complete fresh
+    /// census and `commit_state` must write it as-is.
+    class_replace_all: bool,
 }
 
 struct GitIgnoreContext {
@@ -751,6 +763,9 @@ impl Scanner {
             state,
             custom_state_path: None,
             loaded_cochange_watermark_sha,
+            class_updates: HashMap::new(),
+            class_removals: std::collections::HashSet::new(),
+            class_replace_all: false,
         })
     }
 
@@ -773,6 +788,9 @@ impl Scanner {
             state,
             custom_state_path: Some(state_path_override),
             loaded_cochange_watermark_sha,
+            class_updates: HashMap::new(),
+            class_removals: std::collections::HashSet::new(),
+            class_replace_all: false,
         })
     }
 
@@ -829,6 +847,10 @@ impl Scanner {
     /// persisted map, leaving unchanged files' classifications untouched.
     /// Callers must call `commit_state()` afterwards to persist the merge.
     pub fn apply_file_classifications(&mut self, updates: HashMap<PathBuf, FileClassification>) {
+        for path in updates.keys() {
+            self.class_removals.remove(path);
+        }
+        self.class_updates.extend(updates.clone());
         self.state.file_classifications.extend(updates);
     }
 
@@ -839,6 +861,9 @@ impl Scanner {
         &mut self,
         classifications: HashMap<PathBuf, FileClassification>,
     ) {
+        self.class_replace_all = true;
+        self.class_updates.clear();
+        self.class_removals.clear();
         self.state.file_classifications = classifications;
     }
 
@@ -846,6 +871,8 @@ impl Scanner {
     /// call `commit_state()` afterwards to persist the removal.
     pub fn remove_file_classifications(&mut self, deleted: &[PathBuf]) {
         for path in deleted {
+            self.class_updates.remove(path);
+            self.class_removals.insert(path.clone());
             self.state.file_classifications.remove(path);
         }
     }
@@ -870,10 +897,36 @@ impl Scanner {
         // and writing it back would undo a mid-scan advance and force a full
         // re-mine on every incremental scan (#884 review).
         let mut state = self.state.clone();
+        let persisted = load_state_from_path(&path).ok();
         if state.cochange_watermark_sha == self.loaded_cochange_watermark_sha {
-            state.cochange_watermark_sha = load_state_from_path(&path)
-                .ok()
-                .and_then(|persisted| persisted.cochange_watermark_sha);
+            state.cochange_watermark_sha = persisted
+                .as_ref()
+                .and_then(|p| p.cochange_watermark_sha.clone());
+        }
+
+        // `file_classifications` is extraction-owned and has two writers (#901):
+        // the rebuild-owned scanner inside `build_full_graph_inner` writes the
+        // complete census, then the CLI's own scanner -- loaded before that
+        // rebuild -- commits. Writing its stale map back emptied the census on
+        // every CLI first scan and `--full`. Unless this Scanner holds a
+        // deliberate full replacement, start from what is persisted and apply
+        // only the deltas this Scanner recorded.
+        if !self.class_replace_all {
+            let mut merged = persisted
+                .as_ref()
+                .map(|p| p.file_classifications.clone())
+                .unwrap_or_default();
+            for path in &self.class_removals {
+                merged.remove(path);
+            }
+            merged.extend(
+                self.class_updates
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            // Drop entries for files this scan no longer tracks.
+            merged.retain(|path, _| state.file_mtimes.contains_key(path));
+            state.file_classifications = merged;
         }
 
         save_state_to_path(&path, &state)?;
@@ -1798,7 +1851,23 @@ impl ExcludePattern {
 
     fn matches_file(&self, path: &str) -> bool {
         match self {
-            ExcludePattern::Dir(dirname) => dir_component_matches(dirname, path),
+            // An exact directory name also matches a file of that name at any
+            // depth (documented: `data/` excludes a file named `data`). A glob
+            // directory pattern, however, applies to directory components
+            // only: the default `target*/` must not exclude a *file* named
+            // `targeted-reindex-....md` (#901, found by the release census).
+            ExcludePattern::Dir(dirname) => {
+                if dirname.is_empty() || dirname == "." {
+                    return false;
+                }
+                match dirname.strip_suffix('*') {
+                    Some(prefix) => {
+                        let parent = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                        !parent.is_empty() && parent.split('/').any(|c| c.starts_with(prefix))
+                    }
+                    None => dir_component_matches(dirname, path),
+                }
+            }
             ExcludePattern::Suffix(suffix) => path.ends_with(suffix),
             ExcludePattern::Name(name) => path.rsplit('/').next() == Some(name.as_str()),
             ExcludePattern::Scoped { components, is_dir } => {
@@ -2125,6 +2194,77 @@ mod tests {
     /// #895: scan state from before the census (tracked files, empty
     /// classifications) must trigger one full re-extraction instead of a
     /// no-change scan that would leave the census empty forever.
+    /// #901: two writers share scan-state.json. A scanner that loaded stale
+    /// state must not clobber the census another scanner wrote in between;
+    /// only its own recorded updates/removals apply.
+    #[test]
+    fn commit_state_merges_classifications_from_two_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for rel in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x\n").unwrap();
+        }
+        let cls = |c: FileClass| FileClassification {
+            class: c,
+            detail: None,
+        };
+        // Writer A (the CLI scanner) loads state first -- empty census.
+        let mut cli = Scanner::new(root.to_path_buf()).unwrap();
+        cli.scan().unwrap();
+        // Writer B (the rebuild-owned scanner) writes the full census and commits.
+        let mut rebuild = Scanner::new(root.to_path_buf()).unwrap();
+        rebuild.scan().unwrap();
+        rebuild.set_file_classifications(HashMap::from([
+            (PathBuf::from("src/a.rs"), cls(FileClass::Indexed)),
+            (PathBuf::from("src/b.rs"), cls(FileClass::Indexed)),
+            (PathBuf::from("src/c.rs"), cls(FileClass::NoExtractor)),
+        ]));
+        rebuild.commit_state().unwrap();
+        // Writer A applies an empty delta and commits, as main.rs does.
+        cli.apply_file_classifications(HashMap::new());
+        cli.commit_state().unwrap();
+        let after = load_state(root).unwrap();
+        assert_eq!(
+            after.file_classifications.len(),
+            3,
+            "stale writer must not clobber the census"
+        );
+
+        // A's own deltas still apply on top of what is persisted.
+        let mut cli2 = Scanner::new(root.to_path_buf()).unwrap();
+        cli2.scan().unwrap();
+        cli2.apply_file_classifications(HashMap::from([(
+            PathBuf::from("src/c.rs"),
+            cls(FileClass::Indexed),
+        )]));
+        cli2.remove_file_classifications(&[PathBuf::from("src/b.rs")]);
+        cli2.commit_state().unwrap();
+        let after = load_state(root).unwrap();
+        assert_eq!(after.file_classifications.len(), 2);
+        assert_eq!(after.file_classifications[&PathBuf::from("src/c.rs")].class, FileClass::Indexed);
+        assert!(!after.file_classifications.contains_key(&PathBuf::from("src/b.rs")));
+    }
+
+    /// #901: a *glob* directory pattern must not match a file whose name happens
+    /// to start with the prefix (`target*/` vs `.oh/metis/targeted-....md`).
+    /// Exact names keep the documented behaviour (`data/` excludes a file `data`).
+    #[test]
+    fn glob_dir_pattern_matches_directory_components_only() {
+        assert!(!is_file_excluded(
+            "target*/",
+            ".oh/metis/targeted-reindex.md"
+        ));
+        assert!(!is_file_excluded("target*/", "targets.md"));
+        assert!(is_file_excluded("target*/", "target-194/debug/x.rs"));
+        assert!(is_file_excluded("target*/", "a/target-worktree/b.rs"));
+        assert!(is_dir_excluded("target*/", "some/target-194"));
+        // exact-name directory patterns are unchanged
+        assert!(is_file_excluded("target/", "notes/target"));
+        assert!(is_file_excluded("target/", "some/target/debug/x.rs"));
+    }
+
     #[test]
     fn pre_census_scan_state_forces_full_reextraction() {
         let temp = tempfile::tempdir().unwrap();

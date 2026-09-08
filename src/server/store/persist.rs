@@ -57,7 +57,70 @@ pub(crate) async fn persist_graph_to_lance(
     nodes: &[Node],
     edges: &[Edge],
 ) -> anyhow::Result<()> {
+    // Callers without mining results pass no stats; the writer fills them from
+    // the persisted rows so a plain full persist never erases co-change
+    // support/confidence (#901).
     persist_graph_to_lance_with_cochange(repo_root, nodes, edges, &Default::default()).await
+}
+
+/// Read the persisted `cochange_support`/`cochange_confidence` of every
+/// `CoChanges` edge at the committed scan_version, keyed by edge id.
+///
+/// A full persist appends every edge at a new scan_version; any caller that
+/// does not carry mining results (manifest refresh, enrichment, background
+/// scans, viewer, ...) would otherwise write those two columns as null and the
+/// next load would hydrate nothing -- co-change data silently vanished after
+/// any no-op scan (#901). The writer merges these into the incoming map for
+/// every co-change edge the caller did not supply stats for.
+async fn read_persisted_cochange_stats(
+    db: &lancedb::Connection,
+    db_path: &Path,
+) -> crate::graph::CoChangeStatsMap {
+    use arrow_array::Array;
+    use futures::TryStreamExt;
+    let mut out = crate::graph::CoChangeStatsMap::new();
+    let Ok(table) = db.open_table("edges").execute().await else {
+        return out;
+    };
+    use lancedb::query::{ExecutableQuery, QueryBase};
+    let committed = read_committed_scan_version(db_path);
+    let q = table.query().only_if(format!(
+        "edge_type = 'co_changes' AND scan_version = {committed}"
+    ));
+    let Ok(stream) = q.execute().await else {
+        return out;
+    };
+    let Ok(batches) = stream.try_collect::<Vec<arrow_array::RecordBatch>>().await else {
+        return out;
+    };
+    for batch in &batches {
+        let (Some(ids), Some(supports), Some(confs)) = (
+            batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>()),
+            batch
+                .column_by_name("cochange_support")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>()),
+            batch
+                .column_by_name("cochange_confidence")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float64Array>()),
+        ) else {
+            continue;
+        };
+        for i in 0..batch.num_rows() {
+            if supports.is_null(i) || confs.is_null(i) {
+                continue;
+            }
+            out.insert(
+                ids.value(i).to_string(),
+                crate::graph::CoChangeStats {
+                    support: supports.value(i),
+                    confidence: confs.value(i),
+                },
+            );
+        }
+    }
+    out
 }
 
 /// Same as [`persist_graph_to_lance`], but also writes the
@@ -163,7 +226,34 @@ pub(crate) async fn persist_graph_to_lance_with_cochange(
 
     // -- Append edges with new_version --
     {
-        let batch = build_edges_batch(edges, new_version, cochange_stats)?;
+        // Preserve persisted co-change stats for every CoChanges edge the
+        // caller did not supply (#901). Mining results in `cochange_stats`
+        // always win; only gaps are filled.
+        let needs_fill = edges.iter().any(|e| {
+            e.kind == crate::graph::EdgeKind::CoChanges
+                && !cochange_stats.contains_key(&e.stable_id())
+        });
+        let merged_stats: crate::graph::CoChangeStatsMap;
+        let stats_for_batch: &crate::graph::CoChangeStatsMap = if needs_fill {
+            let persisted = read_persisted_cochange_stats(&db, &db_path).await;
+            let mut m = cochange_stats.clone();
+            for e in edges
+                .iter()
+                .filter(|e| e.kind == crate::graph::EdgeKind::CoChanges)
+            {
+                let id = e.stable_id();
+                if !m.contains_key(&id)
+                    && let Some(s) = persisted.get(&id)
+                {
+                    m.insert(id, *s);
+                }
+            }
+            merged_stats = m;
+            &merged_stats
+        } else {
+            cochange_stats
+        };
+        let batch = build_edges_batch(edges, new_version, stats_for_batch)?;
 
         match db.open_table("edges").execute().await {
             Ok(tbl) => {
@@ -718,6 +808,75 @@ mod tests {
         LspCompletenessReport, current_report_identity, graph_snapshot_digest, load_summary,
         persist_report, persist_report_with_precommit_hook,
     };
+
+    /// #901: a full persist without mining results (manifest refresh, enrichment,
+    /// background scan) must preserve the co-change stats already persisted.
+    #[tokio::test]
+    async fn plain_persist_preserves_persisted_cochange_stats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let anchor = |file: &str| Node {
+            id: crate::git::cochange::file_anchor_node_id("local", Path::new(file)),
+            language: String::new(),
+            signature: format!("file {file}"),
+            line_start: 0,
+            line_end: 0,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Git,
+        };
+        let a = anchor("src/a.rs");
+        let b = anchor("src/b.rs");
+        let edge = Edge {
+            from: a.id.clone(),
+            to: b.id.clone(),
+            kind: crate::graph::EdgeKind::CoChanges,
+            source: ExtractionSource::Git,
+            confidence: crate::graph::Confidence::Detected,
+            evidence: Vec::new(),
+        };
+        let nodes = vec![a, b];
+        let edges = vec![edge.clone()];
+        let mut stats = crate::graph::CoChangeStatsMap::new();
+        stats.insert(
+            edge.stable_id(),
+            crate::graph::CoChangeStats {
+                support: 7,
+                confidence: 0.7,
+            },
+        );
+        persist_graph_to_lance_with_cochange(root, &nodes, &edges, &stats)
+            .await
+            .expect("mining persist");
+
+        // A later non-mining full persist (no stats supplied) ...
+        persist_graph_to_lance(root, &nodes, &edges)
+            .await
+            .expect("plain persist");
+
+        // ... must not have erased the columns.
+        let state = load_graph_from_lance(root).await.expect("load");
+        let got = state
+            .cochange_stats
+            .get(&edge.stable_id())
+            .expect("co-change stats erased by a plain persist");
+        assert_eq!(got.support, 7);
+        assert!((got.confidence - 0.7).abs() < 1e-9);
+
+        // A re-mine with new numbers still wins.
+        stats.insert(
+            edge.stable_id(),
+            crate::graph::CoChangeStats {
+                support: 9,
+                confidence: 0.9,
+            },
+        );
+        persist_graph_to_lance_with_cochange(root, &nodes, &edges, &stats)
+            .await
+            .expect("re-mine persist");
+        let state = load_graph_from_lance(root).await.expect("load");
+        assert_eq!(state.cochange_stats[&edge.stable_id()].support, 9);
+    }
 
     fn make_test_node(name: &str) -> Node {
         Node {
