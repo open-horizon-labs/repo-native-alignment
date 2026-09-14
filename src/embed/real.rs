@@ -1461,6 +1461,21 @@ fn validate_serving_generation_identity(
     );
 
     match config.backend {
+        // A generation created under `backend=cuda, fallback=cpu` while CUDA
+        // was unavailable legitimately records observed_device="cpu": the
+        // `embedding_fallback` identity flag checked above already pins this
+        // acceptance to configs whose current `fallback` matches what the
+        // generation was actually built with, so this does not let a
+        // `fallback=error` config silently accept a CPU generation.
+        EmbeddingBackend::Cuda
+            if config.fallback == FallbackPolicy::Cpu && observed_device == "cpu" =>
+        {
+            anyhow::ensure!(
+                provider == "candle-cpu",
+                "active semantic generation demoted to CPU but records an unexpected provider={}",
+                provider
+            );
+        }
         EmbeddingBackend::Cuda => anyhow::ensure!(
             observed_device == "cuda"
                 && provider == "onnxruntime-cuda"
@@ -6689,66 +6704,108 @@ mod tests {
     }
 
     // The next three tests exercise the isolated CUDA-availability-probe
-    // demotion path on an ordinary GPU-less build/host: `--features cuda` is
-    // compiled in (so `CudaEncoder::new`/the probe subcommand exist), but no
-    // CUDA runtime libraries (e.g. `libcublasLt.so.12`) are present, which is
-    // exactly the condition that corrupted the persisted-graph reopen in
-    // issue #865. They are deliberately NOT `#[ignore]`: unlike
+    // demotion path deterministically: `RNA_CUDA_PROBE_EXE` is pointed at a
+    // path that cannot exist, so the probe subprocess fails to spawn for a
+    // real, well-understood reason, regardless of whether this host's
+    // `current_exe()` (the `cargo test` libtest harness, which does not
+    // implement the hidden `probe-cuda-encoder` subcommand) would also have
+    // failed the probe. That is the same demotion condition the corrupted
+    // persisted-graph reopen in issue #865 depended on. They are
+    // deliberately NOT `#[ignore]`: unlike
     // `production_cuda_session_is_attested_after_inference` (which requires
     // real CUDA hardware to prove positive execution), these assert the
     // negative/fail-safe path, which is the normal case on any CI runner or
-    // dev machine without a GPU.
+    // dev machine without a GPU. `CUDA_PROBE_ENV_LOCK` serializes them
+    // against each other and against the hardware test, since all three
+    // mutate the same process-global `RNA_CUDA_PROBE_EXE` env var and
+    // `cargo test` runs tests concurrently within one process by default.
+    #[cfg(feature = "cuda")]
+    static CUDA_PROBE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Force the isolated CUDA probe to fail for the duration of `body`, by
+    /// pointing `RNA_CUDA_PROBE_EXE` at a path that cannot exist, then
+    /// restore the prior value. Holds `CUDA_PROBE_ENV_LOCK` so concurrently
+    /// running tests never observe a torn/overwritten override.
+    #[cfg(feature = "cuda")]
+    fn with_cuda_probe_forced_unavailable<R>(body: impl FnOnce() -> R) -> R {
+        let _guard = CUDA_PROBE_ENV_LOCK.lock().expect("probe env lock poisoned");
+        let previous = std::env::var_os("RNA_CUDA_PROBE_EXE");
+        // SAFETY: serialized by CUDA_PROBE_ENV_LOCK above; no other test
+        // reads or writes this env var without holding the same lock.
+        unsafe {
+            std::env::set_var(
+                "RNA_CUDA_PROBE_EXE",
+                "/nonexistent/rna-cuda-probe-test-stub",
+            );
+        }
+        let result = body();
+        // SAFETY: see above.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("RNA_CUDA_PROBE_EXE", value),
+                None => std::env::remove_var("RNA_CUDA_PROBE_EXE"),
+            }
+        }
+        result
+    }
+
     #[cfg(all(feature = "cuda", not(feature = "metal")))]
     #[test]
     fn explicit_cuda_fallback_cpu_demotes_to_cpu_without_cuda_runtime() {
-        let config = EmbeddingConfig {
-            backend: EmbeddingBackend::Cuda,
-            fallback: crate::embed::config::FallbackPolicy::Cpu,
-            ..Default::default()
-        };
-        let (model, attestation) = super::new_model_with_config(&config, false)
-            .expect("cuda+fallback=cpu must demote to CPU cleanly, not fail closed");
-        assert!(matches!(model, super::EncoderModel::Candle(_)));
-        assert_eq!(attestation.observed_device, "cpu");
-        assert_eq!(attestation.backend, "candle-cpu");
-        assert!(super::fallback_occurred(
-            config.backend,
-            &attestation.observed_device
-        ));
+        with_cuda_probe_forced_unavailable(|| {
+            let config = EmbeddingConfig {
+                backend: EmbeddingBackend::Cuda,
+                fallback: crate::embed::config::FallbackPolicy::Cpu,
+                ..Default::default()
+            };
+            let (model, attestation) = super::new_model_with_config(&config, false)
+                .expect("cuda+fallback=cpu must demote to CPU cleanly, not fail closed");
+            assert!(matches!(model, super::EncoderModel::Candle(_)));
+            assert_eq!(attestation.observed_device, "cpu");
+            assert_eq!(attestation.backend, "candle-cpu");
+            assert!(super::fallback_occurred(
+                config.backend,
+                &attestation.observed_device
+            ));
+        });
     }
 
     #[cfg(all(feature = "cuda", not(feature = "metal")))]
     #[test]
     fn explicit_cuda_fallback_error_fails_closed_without_cuda_runtime() {
-        let config = EmbeddingConfig {
-            backend: EmbeddingBackend::Cuda,
-            fallback: crate::embed::config::FallbackPolicy::Error,
-            ..Default::default()
-        };
-        let error = match super::new_model_with_config(&config, false) {
-            Ok(_) => panic!(
-                "cuda+fallback=error unexpectedly initialized without a CUDA runtime present"
-            ),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("fallback=error forbids CPU"),
-            "error should name the fail-closed policy explicitly: {error}"
-        );
+        with_cuda_probe_forced_unavailable(|| {
+            let config = EmbeddingConfig {
+                backend: EmbeddingBackend::Cuda,
+                fallback: crate::embed::config::FallbackPolicy::Error,
+                ..Default::default()
+            };
+            let error = match super::new_model_with_config(&config, false) {
+                Ok(_) => panic!(
+                    "cuda+fallback=error unexpectedly initialized without a CUDA runtime present"
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("fallback=error forbids CPU"),
+                "error should name the fail-closed policy explicitly: {error}"
+            );
+        });
     }
 
     #[cfg(feature = "cuda")]
     #[test]
     fn auto_backend_demotes_uniformly_through_the_same_cuda_probe_as_explicit_cuda() {
-        let config = EmbeddingConfig::default();
-        assert_eq!(config.backend, EmbeddingBackend::Auto);
-        let (_model, attestation) = super::new_model_with_config(&config, false)
-            .expect("auto must still complete end to end without a CUDA runtime present");
-        assert_ne!(attestation.observed_device, "cuda");
-        assert!(super::fallback_occurred(
-            config.backend,
-            &attestation.observed_device
-        ));
+        with_cuda_probe_forced_unavailable(|| {
+            let config = EmbeddingConfig::default();
+            assert_eq!(config.backend, EmbeddingBackend::Auto);
+            let (_model, attestation) = super::new_model_with_config(&config, false)
+                .expect("auto must still complete end to end without a CUDA runtime present");
+            assert_ne!(attestation.observed_device, "cuda");
+            assert!(super::fallback_occurred(
+                config.backend,
+                &attestation.observed_device
+            ));
+        });
     }
 
     #[test]
@@ -6762,7 +6819,13 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[tokio::test]
-    #[ignore = "requires a CUDA runtime and downloads the production embedding model"]
+    #[ignore = "requires a CUDA runtime, downloads the production embedding model, and \
+                must be run with RNA_CUDA_PROBE_EXE set to an absolute path to a \
+                `cargo build --features cuda --bin repo-native-alignment` binary — \
+                otherwise the isolated probe re-execs the `cargo test` libtest \
+                harness (via current_exe()), which does not implement the hidden \
+                `probe-cuda-encoder` subcommand, and this test fails closed even on \
+                real CUDA hardware"]
     async fn production_cuda_session_is_attested_after_inference() {
         let config = EmbeddingConfig {
             backend: EmbeddingBackend::Cuda,
@@ -6837,6 +6900,59 @@ mod tests {
         }
         let error = validate_serving_generation_identity(&config, &manifest).unwrap_err();
         assert!(error.to_string().contains("requires CUDA device 0"));
+    }
+
+    #[test]
+    fn serving_reopens_a_cuda_generation_cpu_demoted_under_fallback_cpu() {
+        // A generation built under `backend=cuda, fallback=cpu` while CUDA was
+        // unavailable legitimately records observed_device="cpu". Reopening
+        // it under the same config must succeed instead of being rejected as
+        // a device mismatch (the bug CodeRabbit flagged: this generation
+        // could previously never reopen for serving after a restart).
+        let manifest = manifest_for_serving_test("cpu", "candle-cpu", None);
+        let config = EmbeddingConfig {
+            backend: EmbeddingBackend::Cuda,
+            fallback: crate::embed::config::FallbackPolicy::Cpu,
+            ..Default::default()
+        };
+        let mut manifest = manifest;
+        for (name, value) in config.identity_flags() {
+            manifest
+                .semantic_identity
+                .flags
+                .insert(name.to_string(), value);
+        }
+        validate_serving_generation_identity(&config, &manifest)
+            .expect("cuda+fallback=cpu config should reopen its own CPU-demoted generation");
+    }
+
+    #[test]
+    fn serving_rejects_a_cpu_generation_under_cuda_fallback_error() {
+        // Same CPU-demoted generation as above, but the current config has
+        // since been tightened to `fallback=error`. The stored
+        // `embedding_fallback` identity flag no longer matches, so this must
+        // still fail closed rather than silently serving CPU vectors under a
+        // strict config.
+        let manifest = manifest_for_serving_test("cpu", "candle-cpu", None);
+        let stored_config = EmbeddingConfig {
+            backend: EmbeddingBackend::Cuda,
+            fallback: crate::embed::config::FallbackPolicy::Cpu,
+            ..Default::default()
+        };
+        let mut manifest = manifest;
+        for (name, value) in stored_config.identity_flags() {
+            manifest
+                .semantic_identity
+                .flags
+                .insert(name.to_string(), value);
+        }
+        let strict_config = EmbeddingConfig {
+            backend: EmbeddingBackend::Cuda,
+            fallback: crate::embed::config::FallbackPolicy::Error,
+            ..Default::default()
+        };
+        let error = validate_serving_generation_identity(&strict_config, &manifest).unwrap_err();
+        assert!(error.to_string().contains("embedding_fallback"));
     }
 
     #[test]

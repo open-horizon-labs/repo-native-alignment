@@ -93,8 +93,7 @@ pub fn run_probe(device_id: usize) -> Result<()> {
 /// only proceeds to build a real in-process `CudaEncoder` once the probe has
 /// already proven it safe (child exited 0).
 pub fn probe_available(device_id: usize) -> Result<()> {
-    let exe = std::env::current_exe()
-        .context("resolve current RNA executable for CUDA availability probe")?;
+    let exe = probe_executable()?;
     let output = std::process::Command::new(&exe)
         .arg("probe-cuda-encoder")
         .arg("--device")
@@ -113,6 +112,23 @@ pub fn probe_available(device_id: usize) -> Result<()> {
         "CUDA availability probe failed ({status}): {}",
         stderr.trim()
     );
+}
+
+/// Executable the probe re-execs. Defaults to `current_exe()`, which is
+/// correct in production (the running process genuinely is the
+/// `repo-native-alignment` CLI binary that understands the hidden
+/// `probe-cuda-encoder` subcommand). Under `cargo test --lib`, `current_exe()`
+/// instead resolves to the libtest harness binary, which does not implement
+/// that subcommand and would always fail the probe regardless of real CUDA
+/// availability — including for a real-hardware test, which needs the probe
+/// to genuinely succeed. `RNA_CUDA_PROBE_EXE` lets any caller point the probe
+/// at a real built binary instead (also useful in deployments that wrap the
+/// binary behind a launcher script).
+fn probe_executable() -> Result<PathBuf> {
+    if let Some(path) = absolute_env_path("RNA_CUDA_PROBE_EXE")? {
+        return Ok(path);
+    }
+    std::env::current_exe().context("resolve current RNA executable for CUDA availability probe")
 }
 
 impl CudaEncoder {
