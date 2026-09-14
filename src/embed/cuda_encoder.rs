@@ -73,6 +73,64 @@ pub struct CudaEncoder {
     evidence: CudaExecutionEvidence,
 }
 
+/// Hidden CLI entry point invoked only by the child process `probe_available`
+/// spawns. Builds a real encoder on this device and exits; the exit code
+/// alone is the parent's signal, so no evidence is returned here.
+pub fn run_probe(device_id: usize) -> Result<()> {
+    CudaEncoder::new(device_id).map(|_| ())
+}
+
+/// Probe CUDA availability in an isolated child process before any in-process
+/// CUDA construction. Registering the CUDA execution provider dynamically
+/// loads `libonnxruntime_providers_cuda.so`, which itself depends on
+/// `libcublasLt.so.12`/other CUDA runtime libraries; when those are missing,
+/// the failure occurs inside onnxruntime's own native provider loader and is
+/// not guaranteed to surface as a well-behaved `Result::Err` (`catch_unwind`
+/// does not catch unwinding across an `extern "C"` boundary, nor a native
+/// signal/segfault). Running the exact same construction path in a
+/// throwaway child process means any such fault is contained there — it
+/// cannot corrupt this process's in-flight LanceDB state — and the parent
+/// only proceeds to build a real in-process `CudaEncoder` once the probe has
+/// already proven it safe (child exited 0).
+pub fn probe_available(device_id: usize) -> Result<()> {
+    let exe = probe_executable()?;
+    let output = std::process::Command::new(&exe)
+        .arg("probe-cuda-encoder")
+        .arg("--device")
+        .arg(device_id.to_string())
+        .output()
+        .context("spawn isolated CUDA availability probe subprocess")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = match output.status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    };
+    bail!(
+        "CUDA availability probe failed ({status}): {}",
+        stderr.trim()
+    );
+}
+
+/// Executable the probe re-execs. Defaults to `current_exe()`, which is
+/// correct in production (the running process genuinely is the
+/// `repo-native-alignment` CLI binary that understands the hidden
+/// `probe-cuda-encoder` subcommand). Under `cargo test --lib`, `current_exe()`
+/// instead resolves to the libtest harness binary, which does not implement
+/// that subcommand and would always fail the probe regardless of real CUDA
+/// availability — including for a real-hardware test, which needs the probe
+/// to genuinely succeed. `RNA_CUDA_PROBE_EXE` lets any caller point the probe
+/// at a real built binary instead (also useful in deployments that wrap the
+/// binary behind a launcher script).
+fn probe_executable() -> Result<PathBuf> {
+    if let Some(path) = absolute_env_path("RNA_CUDA_PROBE_EXE")? {
+        return Ok(path);
+    }
+    std::env::current_exe().context("resolve current RNA executable for CUDA availability probe")
+}
+
 impl CudaEncoder {
     pub fn new(device_id: usize) -> Result<Self> {
         let ordinal = i32::try_from(device_id).context("CUDA device exceeds i32 range")?;

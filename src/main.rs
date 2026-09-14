@@ -62,6 +62,12 @@ enum Commands {
     /// Replay a retained post-LSP failure cache without scanning or LSP calls.
     #[command(hide = true)]
     StructuralCacheReplay(StructuralCacheReplayArgs),
+    /// Build a real CUDA MiniLM encoder in this process and exit 0/nonzero.
+    /// Only ever invoked by this same binary's own isolated CUDA-availability
+    /// probe (see `src/embed/cuda_encoder.rs`); never a user-facing entry point.
+    #[cfg(feature = "cuda")]
+    #[command(hide = true, name = "probe-cuda-encoder")]
+    ProbeCudaEncoder(ProbeCudaEncoderArgs),
     Enrich(EnrichArgs),
     Search(SearchArgs),
     Graph(GraphArgs),
@@ -147,6 +153,14 @@ struct LspReadinessArgs {
 struct StructuralCacheIdentityArgs {
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(clap::Args, Debug)]
+struct ProbeCudaEncoderArgs {
+    /// CUDA device ordinal to probe.
+    #[arg(long)]
+    device: usize,
 }
 
 #[derive(clap::Args, Debug)]
@@ -958,6 +972,11 @@ async fn async_main() -> anyhow::Result<()> {
                 receipt.diagnostic_checkpoint_validation_passed && receipt.full_target_ready,
                 "diagnostic retained-cache replay is not READY"
             );
+            return Ok(());
+        }
+        #[cfg(feature = "cuda")]
+        Some(Commands::ProbeCudaEncoder(args)) => {
+            repo_native_alignment::embed::run_cuda_encoder_probe(args.device)?;
             return Ok(());
         }
         Some(Commands::Scan(args)) => {

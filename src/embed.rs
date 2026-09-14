@@ -7,6 +7,17 @@ pub mod config;
 
 #[cfg(feature = "cuda")]
 mod cuda_encoder;
+
+/// Build a real CUDA MiniLM encoder in this process and report only success
+/// or failure. This is the child-process side of the isolated CUDA
+/// availability probe (`cuda_encoder::probe_available`): the hidden
+/// `probe-cuda-encoder` CLI subcommand calls this and exits accordingly, so a
+/// native provider-load fault is contained to a throwaway process instead of
+/// reaching the real `embed_index` pipeline's in-flight LanceDB state.
+#[cfg(feature = "cuda")]
+pub fn run_cuda_encoder_probe(device_id: usize) -> anyhow::Result<()> {
+    cuda_encoder::run_probe(device_id)
+}
 #[path = "embed/generation.rs"]
 pub mod generation;
 
