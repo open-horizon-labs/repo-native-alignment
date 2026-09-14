@@ -972,8 +972,68 @@ fn validate_query_encoder(
     Ok(())
 }
 
+/// True when the requested backend policy permitted an accelerator (CUDA or
+/// Metal via `auto`) but the observed device that actually ran is CPU —
+/// i.e. a demotion happened per `fallback` policy, uniformly for `auto` and
+/// explicit `cuda` requests. Kept as a standalone function so the reporting
+/// surface (`runtime_diagnostic`) and its tests share one definition of
+/// "fallback occurred" instead of duplicating the condition.
+fn fallback_occurred(backend: EmbeddingBackend, observed_device: &str) -> bool {
+    matches!(backend, EmbeddingBackend::Auto | EmbeddingBackend::Cuda) && observed_device == "cpu"
+}
+
 fn new_model() -> Result<EncoderModel> {
     new_model_with_config(&EmbeddingConfig::default(), false).map(|(model, _)| model)
+}
+
+#[cfg(feature = "cuda")]
+fn try_cuda(
+    config: &EmbeddingConfig,
+    start: std::time::Instant,
+) -> Result<(EncoderModel, DeviceAttestation)> {
+    // Prove CUDA is usable in a throwaway child process before ever building
+    // a real encoder in this one: a missing `libcublasLt.so.12` (or other
+    // native CUDA/cuBLAS dependency) fails inside onnxruntime's own C++
+    // provider loader, and that class of failure is not guaranteed to return
+    // as a clean `Result::Err` in this process. Containing it to a child
+    // process keeps this process's in-flight LanceDB state safe regardless.
+    super::cuda_encoder::probe_available(config.cuda_device)
+        .context("isolated CUDA availability probe failed")?;
+    let model = super::cuda_encoder::CudaEncoder::new(config.cuda_device).map_err(|error| {
+        anyhow::anyhow!(
+            "CUDA embedding provider/device initialization failed (device {}): {error}",
+            config.cuda_device
+        )
+    })?;
+    let artifact_sha256 = generation::sha256_file(
+        &std::env::current_exe().context("failed to resolve running RNA artifact")?,
+    )?;
+    let evidence = model.execution_evidence();
+    tracing::info!(
+        provider = %evidence.provider,
+        device_index = evidence.device_id,
+        precision = %evidence.precision,
+        tf32_disabled = evidence.tf32_disabled,
+        cpu_fallback_disabled = evidence.cpu_fallback_disabled,
+        cuda_operations = ?evidence.cuda_operations,
+        cpu_shape_operations = ?evidence.cpu_shape_operations,
+        profile_sha256 = %evidence.profile_sha256,
+        "production MiniLM CUDA execution verified"
+    );
+    let attestation = DeviceAttestation {
+        required_device: "cuda".into(),
+        observed_device: "cuda".into(),
+        backend: "onnxruntime-cuda".into(),
+        device_index: Some(evidence.device_id),
+        artifact_sha256,
+    };
+    tracing::info!(
+        "EmbeddingIndex: MiniLM-L6-v2 ready on CUDA device {} (dim={}) in {:?}",
+        config.cuda_device,
+        EMBEDDING_DIMENSION,
+        start.elapsed()
+    );
+    Ok((EncoderModel::Cuda(model), attestation))
 }
 
 fn new_model_with_config(
@@ -987,7 +1047,7 @@ fn new_model_with_config(
         {
             let mut cuda_config = config.clone();
             cuda_config.backend = EmbeddingBackend::Cuda;
-            match new_model_with_config(&cuda_config, false) {
+            match try_cuda(&cuda_config, start) {
                 Ok(result) => return Ok(result),
                 Err(error) => tracing::warn!(
                     "CUDA unavailable for auto embedding backend; falling back according to policy: {error}"
@@ -997,46 +1057,31 @@ fn new_model_with_config(
     }
 
     let require_metal = require_metal || config.backend == EmbeddingBackend::Metal;
+    // Set only when an explicit `cuda` request was demoted per
+    // `fallback=cpu`: that policy means CPU specifically, not the
+    // CUDA->Metal->CPU cascade `auto` uses, so device selection below must
+    // not attempt Metal in this case.
+    let mut force_cpu_only = false;
 
     if config.backend == EmbeddingBackend::Cuda {
         #[cfg(feature = "cuda")]
         {
-            let model =
-                super::cuda_encoder::CudaEncoder::new(config.cuda_device).map_err(|error| {
-                    anyhow::anyhow!(
-                        "CUDA embedding provider/device initialization failed (device {}): {error}",
-                        config.cuda_device
-                    )
-                })?;
-            let artifact_sha256 = generation::sha256_file(
-                &std::env::current_exe().context("failed to resolve running RNA artifact")?,
-            )?;
-            let evidence = model.execution_evidence();
-            tracing::info!(
-                provider = %evidence.provider,
-                device_index = evidence.device_id,
-                precision = %evidence.precision,
-                tf32_disabled = evidence.tf32_disabled,
-                cpu_fallback_disabled = evidence.cpu_fallback_disabled,
-                cuda_operations = ?evidence.cuda_operations,
-                cpu_shape_operations = ?evidence.cpu_shape_operations,
-                profile_sha256 = %evidence.profile_sha256,
-                "production MiniLM CUDA execution verified"
-            );
-            let attestation = DeviceAttestation {
-                required_device: "cuda".into(),
-                observed_device: "cuda".into(),
-                backend: "onnxruntime-cuda".into(),
-                device_index: Some(evidence.device_id),
-                artifact_sha256,
-            };
-            tracing::info!(
-                "EmbeddingIndex: MiniLM-L6-v2 ready on CUDA device {} (dim={}) in {:?}",
-                config.cuda_device,
-                EMBEDDING_DIMENSION,
-                start.elapsed()
-            );
-            return Ok((EncoderModel::Cuda(model), attestation));
+            match try_cuda(config, start) {
+                Ok(result) => return Ok(result),
+                Err(error) => match config.fallback {
+                    FallbackPolicy::Error => {
+                        anyhow::bail!(
+                            "CUDA embedding backend unavailable and fallback=error forbids CPU: {error}"
+                        );
+                    }
+                    FallbackPolicy::Cpu => {
+                        tracing::warn!(
+                            "CUDA unavailable for explicit cuda embedding backend; demoting to CPU per fallback=cpu policy: {error}"
+                        );
+                        force_cpu_only = true;
+                    }
+                },
+            }
         }
         #[cfg(not(feature = "cuda"))]
         anyhow::bail!(
@@ -1045,7 +1090,7 @@ fn new_model_with_config(
     }
 
     #[cfg(feature = "metal")]
-    let device = if config.backend == EmbeddingBackend::Cpu {
+    let device = if config.backend == EmbeddingBackend::Cpu || force_cpu_only {
         candle_core::Device::Cpu
     } else {
         match candle_core::Device::new_metal(0) {
@@ -1061,6 +1106,10 @@ fn new_model_with_config(
     };
     #[cfg(not(feature = "metal"))]
     let device = {
+        // Without the `metal` feature, CPU is the only device this build can
+        // select regardless of `force_cpu_only`; still touch it so the
+        // demotion outcome above is not silently discarded as dead code.
+        let _ = force_cpu_only;
         if require_metal || config.backend == EmbeddingBackend::Metal {
             anyhow::bail!(
                 "strict embedding execution requires an artifact built with the `metal` feature"
@@ -1940,8 +1989,10 @@ impl EmbeddingIndex {
                         .get("embedding_precision")
                         .map_or("unknown", String::as_str),
                     query_state,
-                    self.embedding_config.backend == EmbeddingBackend::Auto
-                        && manifest.device_attestation.observed_device == "cpu",
+                    fallback_occurred(
+                        self.embedding_config.backend,
+                        &manifest.device_attestation.observed_device,
+                    ),
                 )
             }
             None => format!("{} effective_backend=not_attested", config),
@@ -6635,6 +6686,78 @@ mod tests {
             error.to_string().contains("CUDA") || error.to_string().contains("Metal"),
             "error should report exhausted accelerator attempts: {error}"
         );
+    }
+
+    // The next three tests exercise the isolated CUDA-availability-probe
+    // demotion path on an ordinary GPU-less build/host: `--features cuda` is
+    // compiled in (so `CudaEncoder::new`/the probe subcommand exist), but no
+    // CUDA runtime libraries (e.g. `libcublasLt.so.12`) are present, which is
+    // exactly the condition that corrupted the persisted-graph reopen in
+    // issue #865. They are deliberately NOT `#[ignore]`: unlike
+    // `production_cuda_session_is_attested_after_inference` (which requires
+    // real CUDA hardware to prove positive execution), these assert the
+    // negative/fail-safe path, which is the normal case on any CI runner or
+    // dev machine without a GPU.
+    #[cfg(all(feature = "cuda", not(feature = "metal")))]
+    #[test]
+    fn explicit_cuda_fallback_cpu_demotes_to_cpu_without_cuda_runtime() {
+        let config = EmbeddingConfig {
+            backend: EmbeddingBackend::Cuda,
+            fallback: crate::embed::config::FallbackPolicy::Cpu,
+            ..Default::default()
+        };
+        let (model, attestation) = super::new_model_with_config(&config, false)
+            .expect("cuda+fallback=cpu must demote to CPU cleanly, not fail closed");
+        assert!(matches!(model, super::EncoderModel::Candle(_)));
+        assert_eq!(attestation.observed_device, "cpu");
+        assert_eq!(attestation.backend, "candle-cpu");
+        assert!(super::fallback_occurred(
+            config.backend,
+            &attestation.observed_device
+        ));
+    }
+
+    #[cfg(all(feature = "cuda", not(feature = "metal")))]
+    #[test]
+    fn explicit_cuda_fallback_error_fails_closed_without_cuda_runtime() {
+        let config = EmbeddingConfig {
+            backend: EmbeddingBackend::Cuda,
+            fallback: crate::embed::config::FallbackPolicy::Error,
+            ..Default::default()
+        };
+        let error = match super::new_model_with_config(&config, false) {
+            Ok(_) => panic!(
+                "cuda+fallback=error unexpectedly initialized without a CUDA runtime present"
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("fallback=error forbids CPU"),
+            "error should name the fail-closed policy explicitly: {error}"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn auto_backend_demotes_uniformly_through_the_same_cuda_probe_as_explicit_cuda() {
+        let config = EmbeddingConfig::default();
+        assert_eq!(config.backend, EmbeddingBackend::Auto);
+        let (_model, attestation) = super::new_model_with_config(&config, false)
+            .expect("auto must still complete end to end without a CUDA runtime present");
+        assert_ne!(attestation.observed_device, "cuda");
+        assert!(super::fallback_occurred(
+            config.backend,
+            &attestation.observed_device
+        ));
+    }
+
+    #[test]
+    fn fallback_occurred_flags_auto_and_explicit_cuda_demotion_identically() {
+        assert!(super::fallback_occurred(EmbeddingBackend::Auto, "cpu"));
+        assert!(super::fallback_occurred(EmbeddingBackend::Cuda, "cpu"));
+        assert!(!super::fallback_occurred(EmbeddingBackend::Auto, "cuda"));
+        assert!(!super::fallback_occurred(EmbeddingBackend::Cpu, "cpu"));
+        assert!(!super::fallback_occurred(EmbeddingBackend::Metal, "cpu"));
     }
 
     #[cfg(feature = "cuda")]

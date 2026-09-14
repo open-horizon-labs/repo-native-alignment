@@ -73,6 +73,48 @@ pub struct CudaEncoder {
     evidence: CudaExecutionEvidence,
 }
 
+/// Hidden CLI entry point invoked only by the child process `probe_available`
+/// spawns. Builds a real encoder on this device and exits; the exit code
+/// alone is the parent's signal, so no evidence is returned here.
+pub fn run_probe(device_id: usize) -> Result<()> {
+    CudaEncoder::new(device_id).map(|_| ())
+}
+
+/// Probe CUDA availability in an isolated child process before any in-process
+/// CUDA construction. Registering the CUDA execution provider dynamically
+/// loads `libonnxruntime_providers_cuda.so`, which itself depends on
+/// `libcublasLt.so.12`/other CUDA runtime libraries; when those are missing,
+/// the failure occurs inside onnxruntime's own native provider loader and is
+/// not guaranteed to surface as a well-behaved `Result::Err` (`catch_unwind`
+/// does not catch unwinding across an `extern "C"` boundary, nor a native
+/// signal/segfault). Running the exact same construction path in a
+/// throwaway child process means any such fault is contained there — it
+/// cannot corrupt this process's in-flight LanceDB state — and the parent
+/// only proceeds to build a real in-process `CudaEncoder` once the probe has
+/// already proven it safe (child exited 0).
+pub fn probe_available(device_id: usize) -> Result<()> {
+    let exe = std::env::current_exe()
+        .context("resolve current RNA executable for CUDA availability probe")?;
+    let output = std::process::Command::new(&exe)
+        .arg("probe-cuda-encoder")
+        .arg("--device")
+        .arg(device_id.to_string())
+        .output()
+        .context("spawn isolated CUDA availability probe subprocess")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = match output.status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    };
+    bail!(
+        "CUDA availability probe failed ({status}): {}",
+        stderr.trim()
+    );
+}
+
 impl CudaEncoder {
     pub fn new(device_id: usize) -> Result<Self> {
         let ordinal = i32::try_from(device_id).context("CUDA device exceeds i32 range")?;
